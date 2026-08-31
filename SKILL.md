@@ -31,6 +31,9 @@ python3 $SKILL/cc-usage.py --days 30 --top 12
 # one session in detail (an id prefix is enough)
 python3 $SKILL/cc-usage.py --session 46e2620d --top 15
 
+# per-tool cost summed over every session in the window
+python3 $SKILL/cc-usage.py --days 30 --tools
+
 # live dashboard, recomputed on every load
 python3 $SKILL/cc-usage.py --serve
 
@@ -39,8 +42,13 @@ python3 $SKILL/cc-usage.py --days 30 --dashboard ~/.claude/usage/report.html
 ```
 
 Options: `--days` / `--since`, `--project <substring>`, `--by repo|cwd|dir`,
-`--split-worktrees`, `--models`, `--sessions N`, `--daily`, `--top N`, `--json`,
-`--no-cost-state`, `--no-fetch`.
+`--split-worktrees`, `--models`, `--sessions N`, `--daily`, `--tools` / `--tools-max N`,
+`--top N`, `--json`, `--no-cost-state`, `--no-fetch`, `--statusline`.
+
+`--tools` is the one to reach for when the question is about a habit rather than a
+session ("is Read expensive for me", "what do subagents cost me"): it runs the
+per-session attribution over the whole window and sums it. It parses every transcript,
+so it is the slow one — a couple of seconds for a few hundred sessions.
 
 Dashboard sorting and filtering: `--sort-sessions date-desc|date-asc|cost-desc|cost-asc|project-asc`
 (default `date-desc`, most recent first),
@@ -62,8 +70,9 @@ transcripts: it is authoritative and the script takes it first. For earlier sess
 rebuilt from the transcript's `usage` blocks — and that is a **floor**, not a measurement:
 the transcript keeps only the final branch of the conversation, so whatever was abandoned
 after a rewind was still billed but no longer appears there, and the Haiku titling calls are
-never written to it. On sessions where both exist, the measured gap is -51 %. Always state
-the coverage ("N of M sessions are exact") rather than presenting a total as a measurement.
+never written to it. Across sessions where both exist, weighted by cost, the transcript
+accounts for 83 % of the counter. Always state the coverage ("N of M sessions are exact")
+rather than presenting a total as a measurement.
 
 **Cost is not in the tool call, it is in what the call leaves in context.** Every turn
 resends the whole accumulation. A 40 k-token `Read` at turn 5 of a 100-turn session is
@@ -72,6 +81,27 @@ re-read 95 times. `--session` attribution measures the real context growth betwe
 then weights it by the number of turns that carried it. The "carried" column counts those
 repetitions. On a turn with several parallel calls, the delta is split in proportion to
 result size.
+
+**Four lines carry no tool name, and each means something different.** `(startup)` is the
+system prompt, CLAUDE.md and the tool definitions, loaded once and carried by every turn.
+`(compaction)` is what a `/compact` rebuilt, read off the transcript's own flag, not
+guessed. `(context reset)` is a rewind — the tokens were already loaded once, the line is
+the re-baselining. `(replayed output)` is Claude's own replies resent as input on every
+later turn: billed once as generation, then again at the input rate for as long as they are
+carried, which makes it grow with session length rather than with reply size. On a long
+session it is often the largest single line, and the only cure is a shorter session.
+
+**Subagents run their own context.** Their transcripts live in
+`<project>/<session>/subagents/agent-*.jsonl`, not in the parent file. What the main
+session paid is only the report handed back — the `Agent` line; what the run itself cost is
+the `(subagents)` line and the per-agent table. On fan-out sessions they routinely outweigh
+the whole main chain, so never answer "why was this session expensive" without looking at
+them.
+
+**An idle gap costs money.** The prompt cache entry lives five minutes. After a longer
+pause the next turn rewrites the whole prefix at the write rate instead of reading it back
+at a tenth of it. The script reports those turns, the tokens rewritten and the avoidable
+cost. It is the one finding a user can act on without changing how they work — only when.
 
 **Do not confuse re-reading with waste.** A re-read after a compaction is legitimate, the
 context was emptied. A `Read` with `offset`/`limit` is a partial read, not a duplicate.
@@ -83,18 +113,23 @@ Separate the two before concluding there is redundancy.
   written at the head of the new file. Context restarts at ~55 k of startup material, part
   of it served from cache.
 - `/compact` stays in the **same session** and injects a summary carried by every later
-  turn. Measured on a real session: $5.41 for a single compaction.
+  turn. Detected on the transcript's `isCompactSummary` flag, so it is named rather than
+  inferred. Over 31 compactions on this machine: $2.70 each on average, $5.41 on the worst.
 - The cache is written with a 1 h TTL, billed at 2x the input rate. The script reads the
-  `cache_creation.ephemeral_1h_input_tokens` / `ephemeral_5m_input_tokens` split.
+  `cache_creation.ephemeral_1h_input_tokens` / `ephemeral_5m_input_tokens` split, and takes
+  the 1 h rate from LiteLLM's `cache_creation_input_token_cost_above_1hr` when it has one.
 - Claude Code rewrites each assistant message several times (streaming deltas).
   Deduplication happens on `message.id`; without it, +87 % overcount.
-- Subagents are not flagged `isSidechain` in these transcripts: their usage lands in the
-  global counter but not in the per-tool breakdown.
+- Subagent turns carry `isSidechain: true`, but only inside their own transcript, one
+  directory below the session file. The parent transcript never mentions their usage.
 
 ## Limits to state
 
 - Cost is at the **public API list price**, not what a subscription bills. It is a
   comparative measure.
-- The long-context rate (beyond 200 k) is not modelled in the fallback computation.
+- Past 200 k tokens of prompt the API charges a premium rate. It is applied where LiteLLM
+  publishes one; where it does not, the run says how many requests were affected and their
+  cost is a floor.
+- Day boundaries follow the machine's timezone, not the UTC stored in the transcripts.
 - Prices come from LiteLLM, cached 24 h in `~/.cache/cc-usage/`. Offline, the last cache is
   used; with no cache, tokens are counted and cost is 0, and that is reported.

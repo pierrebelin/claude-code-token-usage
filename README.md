@@ -67,15 +67,42 @@ echo "alias ccusage='python3 ~/.claude/skills/token-usage/cc-usage.py'" >> ~/.zs
 ccusage --days 30 --top 12             # where the money goes, grouped by git root
 ccusage --days 30 --sessions 10        # spot the costly session
 ccusage --session 46e2620d --top 15    # take it apart
+ccusage --days 30 --tools              # the same breakdown, summed over every session
 ```
+
+`--session` takes one session apart:
 
 ```
 Source                 Calls  Tokens added  Cost $  Share
-Bash                     198        162.1k   20.88    28%
-(startup)                  3         94.9k   20.04    27%
-(response generation)    224        251.9k   20.50    28%
-Read                       6         76.8k    7.03    10%
+(replayed output)        221        248.7k   10.91    11%
+Bash                     198        162.1k    8.72     9%
+(compaction)               2         73.4k    5.81     6%
+Read                       6         76.8k    2.94     3%
+(startup)                  1         21.4k    2.56     3%
+(response generation)    224        251.9k    8.56     9%
+(subagents)                4         60.9k   57.85    58%
 ```
+
+`--tools` runs that attribution across the whole window and sums it, which turns an
+anecdote into a measure. It parses every transcript in the window — 2.4 s for 200
+sessions here — so it sits behind its own flag.
+
+## Status line
+
+```bash
+cc-usage.py --statusline
+```
+
+Reads Claude Code's status JSON on stdin and prints one line — `$3.10 today · session
+$0.42 · ctx 84k` — in about 0.1 s. Wire it into `~/.claude/settings.json`:
+
+```json
+{ "statusLine": { "type": "command",
+                  "command": "python3 ~/.claude/skills/token-usage/cc-usage.py --statusline" } }
+```
+
+It appends `cache rebuilds $X` once that figure passes 50 cents, which is the one
+number you can still act on while the session is running.
 
 ## Options
 
@@ -88,6 +115,8 @@ Read                       6         76.8k    7.03    10%
 | `--session <prefix>` | break down a single session |
 | `--sessions N` | the N costliest sessions |
 | `--models` / `--daily` | per-model / per-day breakdown |
+| `--tools` / `--tools-max N` | per-tool cost summed over the window (default cap: 500 sessions) |
+| `--statusline` | one line for Claude Code's `statusLine` hook |
 | `--top N` | limit the display |
 | `--serve [PORT]` | live dashboard (default 8787) |
 | `--dashboard FILE` | write a self-contained HTML page |
@@ -98,7 +127,7 @@ Read                       6         76.8k    7.03    10%
 | `--sort-sessions <key>` | `date-desc` (default), `date-asc`, `cost-desc`, `cost-asc`, `project-asc` |
 | `--sort-turns <key>` | `cost-desc` (default), `cost-asc`, `added-desc`, `carried-desc`, `turn-asc`, `turn-desc` |
 | `--filter-sessions <text>` / `--filter-turns <text>` | text filters |
-| `--sessions-max N` | detailed sessions (default 14, max 60) |
+| `--sessions-max N` | detailed sessions (default 5, max 60) |
 
 ## How reliable the figures are
 
@@ -107,8 +136,9 @@ authoritative and taken first — those sessions carry the `exact` chip.
 
 **Rebuilt from the transcript** for older ones. This is a **floor**: the transcript keeps
 only the final branch, so whatever was abandoned after a rewind was still billed but no
-longer appears, and Haiku titling calls are never written. Measured gap where both exist:
-**-51 %**. Those sessions carry the `floor` chip.
+longer appears, and Haiku titling calls are never written. Across the sessions where both
+exist, weighted by cost, the transcript accounts for **83 %** of the counter. Those
+sessions carry the `floor` chip.
 
 In session view, when the counter exists, amounts are rescaled onto it: the breakdown
 comes from the transcript, the level from the counter.
@@ -121,20 +151,44 @@ later turn.
 
 Attribution measures real context growth between two turns —
 `ctx(i) - ctx(i-1) - output(i-1)`, read from the API's `usage`, no tokenizer estimate —
-then weights it by the number of turns that carried it. The sum reconstitutes the
-session's context cost exactly. On a turn with parallel calls the delta is split in
-proportion to result size; a compaction opens a new segment.
+then weights it by the number of turns that carried it. On a turn with parallel calls the
+delta is split in proportion to result size.
+
+Two things re-base that accumulation, and the breakdown names them apart. A `/compact` is
+read off the transcript's own `isCompactSummary` flag rather than guessed from a drop in
+context size. A rewind leaves no flag at all: it only shows up as a context that shrank,
+which is what the `(context reset)` line is.
+
+The `output(i-1)` term above is Claude's own reply, which joins the conversation and is
+resent as input on every later turn — billed once as generation, then again at the input
+rate for as long as it is carried. That is the `(replayed output)` line, and on a long
+session it is routinely the single largest one. With it in place the sum reconstitutes the
+session's measured context cost exactly, to the token, on every session tested.
 
 ## What it reveals
 
-- **Producing code costs nothing.** One session: 108 `Edit` for $0.64, 102 `Read` for
-  $16.86. You pay for loading context.
-- **Startup is a major line item.** System prompt + CLAUDE.md + tool definitions: 42.6 k
-  tokens carried over 154 turns, $4.32 in one session. Every kilo-token of CLAUDE.md has a
-  recurring cost.
-- **`/compact` is expensive.** The injected summary is carried by every later turn: $5.41
-  for one measured compaction. `/clear` costs a fraction — prefer it when the subject
-  changes outright.
+Figures below come from `--days 30 --tools` on one machine — 194 sessions, so a measure
+rather than an anecdote. Run it on yours; the shape holds, the numbers will not.
+
+- **Producing code costs nothing.** 3 226 `Edit` calls: **$22**. 2 450 `Read` calls:
+  **$325**. Fewer calls, fifteen times the cost. You pay for loading context, not for
+  changing it.
+- **Claude's own replies are the largest line.** `(replayed output)` — every reply resent
+  as context on every later turn — came to **$597, 20 %** of everything. It grows with
+  session length, not with reply size, and nothing but ending the session shortens it.
+- **Startup is a recurring bill, not a one-off.** System prompt, CLAUDE.md and tool
+  definitions: **$460 over 194 sessions**, ~$2.40 each, paid again on every turn of every
+  one of them. Every kilo-token of CLAUDE.md has a running cost.
+- **Subagents dominate when you use them.** 46 sessions out of 194 launched any, and those
+  runs alone came to **$359**. On the costliest session on record they were 58 % of the
+  bill, against 33 % for everything the main chain loaded.
+- **`/compact` is expensive.** The injected summary is carried by every later turn: 31
+  compactions, **$84**, roughly $2.70 each. `/clear` costs a fraction — prefer it when the
+  subject changes outright.
+- **Idle time has a price.** The prompt cache expires after five minutes; the next turn
+  then rewrites the whole prefix at the write rate instead of reading it back at a tenth.
+  222 turns did exactly that, **$264** of avoidable cost, after a pause of 11 minutes on
+  median.
 - **Re-reads are not the problem.** Post-compaction reads and `offset` reads set aside,
   only 2 % genuine redundancy was left.
 
@@ -142,9 +196,10 @@ proportion to result size; a compaction opens a new segment.
 
 - Public API list price, not what a subscription bills. A comparative measure, not an
   invoice.
-- The long-context rate (beyond 200 k tokens) is not modelled in the fallback computation.
-- Subagents are not flagged `isSidechain`: their usage lands in the global counter but not
-  in the per-tool breakdown.
+- Beyond 200 k tokens of prompt the API charges a premium rate. It is applied where
+  LiteLLM publishes one; where it does not, the request is priced at the standard rate and
+  the run says how many were affected, so the total is a floor for those.
+- Day boundaries follow the machine's timezone, not the UTC the transcripts store.
 - LiteLLM prices, cached 24 h in `~/.cache/cc-usage/`. Offline with no cache: tokens
   counted, cost 0, reported explicitly.
 - Two optional outbound requests, neither carrying your data: the LiteLLM price file
