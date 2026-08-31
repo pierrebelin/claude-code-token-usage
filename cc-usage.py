@@ -1200,6 +1200,31 @@ FACT_TIPS = {
 }
 
 
+EXACT_TIP = ("Cost read from the cost-state counter Claude Code writes into the "
+             "transcript itself. Authoritative: this is what the session was billed.")
+
+FLOOR_TIP = ("No cost-state counter in this transcript, so the cost is rebuilt from "
+             "its usage blocks. The transcript keeps only the final branch, so work "
+             "abandoned after a rewind was billed but no longer appears, and the "
+             "Haiku titling calls are never written to it. A minimum, not a "
+             "measurement \u2014 across the sessions carrying both, the transcript "
+             "accounts for 83 % of the counter.")
+
+
+def _chip(exact: bool, focusable: bool = True) -> str:
+    """The exact/floor chip, explaining on hover what the figure rests on.
+
+    Inside a clickable row the chip takes no tab stop of its own: the row
+    already is one, and a second stop on a purely explanatory pill would only
+    lengthen the keyboard path through the list.
+    """
+    tip = EXACT_TIP if exact else FLOOR_TIP
+    label = "exact" if exact else "floor"
+    focus = ' tabindex="0"' if focusable else ""
+    return (f'<span class="chip {label} src"{focus} '
+            f'data-tip="{html_escape(tip)}">{label}</span>')
+
+
 def _th(label: str, numeric: bool = False) -> str:
     """A column header that explains itself on hover, reusing the .src tooltip."""
     tip = COLUMN_TIPS.get(label)
@@ -1387,8 +1412,6 @@ def render_session_detail(session: dict, payload: dict, standalone: bool) -> lis
     """Renders one session: headline figures, per-tool breakdown, turns."""
     esc = html_escape
     out = []
-    chip = "exact" if session["exact"] else "floor"
-    chip_label = "exact" if session["exact"] else "floor"
     compact_plural = "s" if session["compactions"] != 1 else ""
     prompt_plural = "s" if session["prompts"] != 1 else ""
     turn_plural = "s" if session["turns"] != 1 else ""
@@ -1407,7 +1430,7 @@ def render_session_detail(session: dict, payload: dict, standalone: bool) -> lis
         out.append(f'<h1>{esc(session["project"])}</h1>')
         out.append(f'<div class="identity"><span class="hero-cost"><span>$</span>'
                    f'{_money(session["cost"])}</span>'
-                   f'<span class="chip {chip}">{chip_label}</span></div>')
+                   f'{_chip(session["exact"])}</div>')
         run = [f'<span>{esc(_span(session["start"], session["end"]))}</span>']
         elapsed = _elapsed(session["start"], session["end"])
         if elapsed:
@@ -1609,7 +1632,7 @@ def render_body(payload: dict) -> str:
     served = bool(payload.get("served"))
 
     out = ['<div class="wrap">', "<header>"]
-    out.append("<h1>Claude Code usage report</h1>")
+    out.append("<h1>Claude Code Token Usage</h1>")
     out.append('<p class="lede">What the sessions cost, project by project, then what '
                "filled the context inside each one. Rebuilt locally from the "
                "transcripts; nothing leaves the machine.</p>")
@@ -1641,18 +1664,6 @@ def render_body(payload: dict) -> str:
                    f"<b>{prefix}{value}</b></div>")
     out.append("</div>")
 
-    cov = payload["coverage"]
-    estimated = max(0, cov["total"] - cov["measured"])
-    if estimated == 0:
-        note = (f'<strong>{cov["measured"]} of {cov["total"]} sessions</strong> come from '
-                "Claude Code's internal counter. Figures are exact.")
-    else:
-        note = (f'<strong>{cov["measured"]} of {cov["total"]} sessions</strong> come from '
-                "Claude Code's internal counter and are exact. The other "
-                f"{estimated} are rebuilt from the transcript, which keeps only the "
-                "final branch: whatever was abandoned after a rewind was still "
-                "billed but no longer appears there. For those, the total is a floor.")
-    out.append(f'<div class="caveat">{note}</div>')
     out.append("</header>")
 
     daily = payload["daily"]
@@ -1759,8 +1770,6 @@ def render_body(payload: dict) -> str:
         out.append('<div class="rows">')
         peak_session = max(s["cost"] for s in payload["sessions"]) or 1
         for rank, session in enumerate(payload["sessions"], 1):
-            chip = "exact" if session["exact"] else "floor"
-            chip_label = "exact" if session["exact"] else "floor"
             compact_plural = "s" if session["compactions"] != 1 else ""
             prompt_plural = "s" if session["prompts"] != 1 else ""
             turn_plural = "s" if session["turns"] != 1 else ""
@@ -1774,11 +1783,12 @@ def render_body(payload: dict) -> str:
             out.append(
                 f'<a class="row" style="--share:{share:.1f}%" '
                 f'href="{esc(prefix + target)}">'
+                f'<span class="row-fill"></span>'
                 f'<span class="rank">{rank:02d}</span>' 
                 f'<span class="row-main"><span class="row-title">'
                 f'<span class="proj">{esc(session["project"])}</span>'
                 f'<span class="id">{esc(session["short"])}</span>'
-                f'<span class="chip {chip}">{chip_label}</span></span>'
+                f'{_chip(session["exact"], focusable=False)}</span>'
                 f'<span class="row-meta">{esc(meta)}</span></span>'
                 f'<span class="row-cost">${_money(session["cost"])}</span></a>')
         out.append("</div>")

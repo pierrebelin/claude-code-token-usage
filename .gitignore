@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 *.html
 !cc-usage-template.html
+.DS_Store

@@ -249,17 +249,6 @@
     vertical-align: .3em;
   }
 
-  .caveat {
-    font-size: 13px;
-    color: var(--muted);
-    background: var(--sunk);
-    border: 1px solid var(--hair);
-    border-left: 2px solid var(--brass);
-    border-radius: var(--r-sm);
-    padding: 13px 17px;
-  }
-  .caveat strong { color: var(--ink); font-weight: 600; }
-
   /* --- per-project bars ------------------------------------------------ */
   .bars {
     border: 1px solid var(--line);
@@ -501,11 +490,19 @@
     padding: 14px 18px;
     text-decoration: none;
     color: inherit;
-    overflow: hidden;
     box-shadow: var(--shadow-sm);
     transition: border-color .15s, transform .15s, box-shadow .15s;
   }
-  .row::after {
+  /* The share bar carries the rounded clipping itself, so the row can let a
+     chip tooltip escape its box. */
+  .row-fill {
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    overflow: hidden;
+    pointer-events: none;
+  }
+  .row-fill::after {
     content: "";
     position: absolute;
     left: 0;
@@ -518,7 +515,11 @@
     border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
     transform: translateY(-1px);
     box-shadow: var(--shadow);
+    z-index: 4;
   }
+  /* Inside a clickable row the chip keeps the row's pointer: it is not a
+     separate target, only an explanation on hover. */
+  .row .chip.src { cursor: inherit; }
   .row:hover .row-cost { color: var(--accent); }
   .rank {
     font-family: var(--mono);
@@ -528,7 +529,14 @@
   }
   .row-main { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
   .row-title { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
-  .proj { font-weight: 600; font-size: 14.5px; letter-spacing: -.012em; }
+  /* The row no longer clips, so a long unbroken name has to wrap on its own. */
+  .proj {
+    font-weight: 600;
+    font-size: 14.5px;
+    letter-spacing: -.012em;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
   .id {
     font-family: var(--mono);
     font-size: 10.5px;
@@ -593,6 +601,28 @@
     border-color: color-mix(in srgb, var(--brass) 38%, transparent);
     background: color-mix(in srgb, var(--brass) 9%, transparent);
   }
+
+  /* A chip can carry the .src tooltip too. It keeps its pill shape, loses the
+     dotted underline, and always drops downwards: in the hero and in the
+     coverage note alike, there is no room above it. */
+  .chip.src {
+    border-bottom-style: solid;
+    border-bottom-color: color-mix(in srgb, currentColor 38%, transparent);
+    vertical-align: baseline;
+  }
+  .chip.src::after {
+    bottom: auto;
+    top: calc(100% + 9px);
+    left: -10px;
+    transform: translateY(-4px);
+    z-index: 7;
+    text-transform: none;
+    letter-spacing: 0;
+    font-weight: 400;
+    color: var(--ink);
+  }
+  .chip.src:hover { border-bottom-color: currentColor; }
+  .chip.src:hover::after, .chip.src:focus-visible::after { transform: none; }
 
   /* --- session page ------------------------------------------------------ */
   .back {
