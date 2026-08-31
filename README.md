@@ -41,7 +41,9 @@ python3 ~/.claude/skills/token-usage/cc-usage.py --serve
 
 `http://127.0.0.1:8787/`, loopback only, re-runs the analysis on every load (~0.8 s).
 Home page: counters, cost per project, daily curve, session list. Each row opens its own
-page (~0.1 s), showing the per-tool breakdown and every turn.
+page (~0.1 s), showing the session's own improvement leads, per-tool breakdown and every
+turn. A lead appears only when it accounts for at least 10% of that session and $0.25, so
+small categories do not turn into noise.
 
 ![Session page: what filled the context, then turn by turn](docs/dashboard-session.png)
 
@@ -68,6 +70,7 @@ ccusage --days 30 --top 12             # where the money goes, grouped by git ro
 ccusage --days 30 --sessions 10        # spot the costly session
 ccusage --session 46e2620d --top 15    # take it apart
 ccusage --days 30 --tools              # the same breakdown, summed over every session
+ccusage --days 7 --triage               # the few costly patterns worth opening
 ```
 
 `--session` takes one session apart:
@@ -116,6 +119,7 @@ number you can still act on while the session is running.
 | `--sessions N` | the N costliest sessions |
 | `--models` / `--daily` | per-model / per-day breakdown |
 | `--tools` / `--tools-max N` | per-tool cost summed over the window (default cap: 500 sessions) |
+| `--triage` | the three costly patterns most worth inspecting |
 | `--statusline` | one line for Claude Code's `statusLine` hook |
 | `--top N` | limit the display |
 | `--serve [PORT]` | live dashboard (default 8787) |
@@ -125,7 +129,7 @@ number you can still act on while the session is running.
 | `--no-cost-state` | ignore the internal counters, recompute everything |
 | `--no-fetch` | do not query LiteLLM for prices |
 | `--sort-sessions <key>` | `date-desc` (default), `date-asc`, `cost-desc`, `cost-asc`, `project-asc` |
-| `--sort-turns <key>` | `cost-desc` (default), `cost-asc`, `added-desc`, `carried-desc`, `turn-asc`, `turn-desc` |
+| `--sort-turns <key>` | `cost-desc` (default), `cost-asc`, `added-desc`, `context-desc`, `turn-asc`, `turn-desc` |
 | `--filter-sessions <text>` / `--filter-turns <text>` | text filters |
 | `--sessions-max N` | detailed sessions (default 5, max 60) |
 

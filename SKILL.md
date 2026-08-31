@@ -34,6 +34,9 @@ python3 $SKILL/cc-usage.py --session 46e2620d --top 15
 # per-tool cost summed over every session in the window
 python3 $SKILL/cc-usage.py --days 30 --tools
 
+# three costly patterns worth opening next
+python3 $SKILL/cc-usage.py --days 7 --triage
+
 # live dashboard, recomputed on every load
 python3 $SKILL/cc-usage.py --serve
 
@@ -42,7 +45,7 @@ python3 $SKILL/cc-usage.py --days 30 --dashboard ~/.claude/usage/report.html
 ```
 
 Options: `--days` / `--since`, `--project <substring>`, `--by repo|cwd|dir`,
-`--split-worktrees`, `--models`, `--sessions N`, `--daily`, `--tools` / `--tools-max N`,
+`--split-worktrees`, `--models`, `--sessions N`, `--daily`, `--tools` / `--tools-max N`, `--triage`,
 `--top N`, `--json`, `--no-cost-state`, `--no-fetch`, `--statusline`.
 
 `--tools` is the one to reach for when the question is about a habit rather than a
@@ -52,12 +55,14 @@ so it is the slow one — a couple of seconds for a few hundred sessions.
 
 Dashboard sorting and filtering: `--sort-sessions date-desc|date-asc|cost-desc|cost-asc|project-asc`
 (default `date-desc`, most recent first),
-`--filter-sessions <text>` (project or id), `--sort-turns cost-desc|cost-asc|added-desc|carried-desc|turn-asc|turn-desc`,
+`--filter-sessions <text>` (project or id), `--sort-turns cost-desc|cost-asc|added-desc|context-desc|turn-asc|turn-desc`,
 `--filter-turns <text>` (tool or label), `--sessions-max N`, `--focus <prefix>`
 (with `--dashboard`, writes the page for a single session).
 
 In `--serve` mode the home page carries the overview and the session list; each row opens
-`/session?id=...`, which reads a single transcript (~0.1 s) and unrolls every turn.
+`/session?id=...`, which reads a single transcript (~0.1 s), starts with its own
+improvement leads, then unrolls every turn. A lead appears only from 10% of that session
+and $0.25, so small categories do not turn into noise.
 In a frozen page everything fits in one file: the list points at internal anchors. In `--serve`
 mode, two GET forms expose the same settings and the state lives in the URL
 (`?days=30&sort=date-desc&q=backend&tsort=turn-asc&tq=Read`): shareable, reloadable,

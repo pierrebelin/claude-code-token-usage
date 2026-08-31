@@ -476,6 +476,45 @@
     text-align: center;
   }
 
+  /* --- short investigation list ---------------------------------------- */
+  .triage-list { display: flex; flex-direction: column; gap: 7px; }
+  .triage-item {
+    display: grid;
+    grid-template-columns: 26px minmax(0, 1fr) auto;
+    gap: 16px;
+    align-items: center;
+    padding: 14px 18px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    box-shadow: var(--shadow-sm);
+  }
+  .triage-rank {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--faint);
+    font-variant-numeric: tabular-nums;
+  }
+  .triage-main { min-width: 0; }
+  .triage-title { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+  .triage-title b {
+    font-family: var(--mono);
+    font-size: 16px;
+    color: var(--accent);
+    font-variant-numeric: tabular-nums;
+  }
+  .triage-title span { font-weight: 600; font-size: 14px; }
+  .triage-main p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+  .triage-main .triage-advice { color: var(--ink); }
+  .triage-advice::before { content: "→ "; color: var(--accent); }
+  .triage-tips {
+    margin: 9px 0 0;
+    padding-left: 18px;
+    color: var(--muted);
+    font-size: 12.5px;
+  }
+  .triage-tips li { margin: 3px 0; }
+
   /* --- session list (index) --------------------------------------------- */
   .rows { display: flex; flex-direction: column; gap: 7px; }
   .row {
@@ -933,6 +972,8 @@
     .bar-row { grid-template-columns: 1fr auto; gap: 10px 14px; }
     .bar-track { grid-column: 1 / -1; }
     .row { grid-template-columns: minmax(0, 1fr) auto; padding: 13px 15px; }
+    .triage-item { grid-template-columns: minmax(0, 1fr) auto; padding: 13px 15px; }
+    .triage-rank { display: none; }
     .rank { display: none; }
     .filter select, .filter .grow { width: 100%; flex-basis: 100%; }
   }

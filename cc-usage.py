@@ -804,6 +804,10 @@ TURN_SORTS = {
 }
 
 DEFAULT_SESSION_SORT = "date-desc"
+TRIAGE_SESSION_LIMIT = 12
+TRIAGE_RESULT_LIMIT = 3
+SESSION_FINDING_MIN_SHARE = 0.10
+SESSION_FINDING_MIN_COST = 0.25
 
 SESSION_SORTS = {
     "cost-desc": "Costliest first",
@@ -968,7 +972,7 @@ def session_payload(path: Path, table, memo, top: int = 15,
                 if needle in r["label"].lower() or needle in r["tool"].lower()]
     _label, key = TURN_SORTS.get(turn_sort, TURN_SORTS["cost-desc"])
     kept = sorted(rows, key=key)
-    return {
+    payload = {
         "id": path.stem,
         "short": path.stem[:8],
         "project": os.path.basename((meta["cwd"] or "").rstrip("/")) or "?",
@@ -998,6 +1002,8 @@ def session_payload(path: Path, table, memo, top: int = 15,
         "entries": kept[:top],
         "entries_total": len(kept),
     }
+    payload["triage"] = session_findings(payload)
+    return payload
 
 
 def aggregate_sources(session_ids, table, memo, limit: int | None = None):
@@ -1051,6 +1057,117 @@ def aggregate_sources(session_ids, table, memo, limit: int | None = None):
             "total": round(total, 4), "cache": cache,
             "agents": [dict(v, type=k) for k, v in
                        sorted(agents.items(), key=lambda kv: -kv[1]["cost"])]}
+
+
+def session_findings(detail: dict):
+    """Returns the actionable patterns found in one already-parsed session."""
+    findings = []
+
+    def add(kind: str, cost: float, reason: str, advice: str, tips: tuple[str, str]):
+        threshold = max(SESSION_FINDING_MIN_COST,
+                        detail["cost"] * SESSION_FINDING_MIN_SHARE)
+        if cost < threshold:
+            return
+        findings.append({"kind": kind, "cost": round(cost, 4),
+                         "reason": reason, "advice": advice, "tips": tips,
+                         "id": detail["id"], "short": detail["short"],
+                         "project": detail["project"]})
+
+    cache = detail.get("cache") or {}
+    if cache.get("extra_cost", 0) > 0:
+        add("cache", cache["extra_cost"],
+            f"The prompt cache was rebuilt on {cache['count']} turn(s).",
+            "When continuing the same task, resume before the cache expires.",
+            ("Do not rush work just for the cache; this matters only when you were already "
+             "about to resume the same task.",
+             "After a long break, treat the next turn as a deliberate restart rather than "
+             "an unexpected extra cost."))
+
+    if detail.get("cost_agents", 0) > 0:
+        share = 100 * detail["cost_agents"] / max(detail["cost"], 0.0001)
+        add("subagents", detail["cost_agents"],
+            f"Subagents account for {share:.0f}% of this session.",
+            "Check whether fewer, narrower agents would cover the work.",
+            ("Give each agent one outcome, explicit files or boundaries, and a clear "
+             "stop condition.",
+             "Avoid overlapping exploration: have one agent locate the code before "
+             "asking another to change it."))
+
+    sources = {source["tool"]: source["cost"] for source in detail["sources"]}
+    replayed = sources.get("(replayed output)", 0)
+    if replayed > 0:
+        add("replayed-output", replayed,
+            "Earlier replies remained in context and were replayed on later turns.",
+            "At the next change of phase, start a fresh session.",
+            ("Split work at natural handoffs: investigation, implementation, then review.",
+             "Carry only a short handoff summary into the next session, not the whole "
+             "working conversation."))
+
+    tool_sources = [source for source in detail["sources"]
+                    if not source["tool"].startswith("(")]
+    if tool_sources:
+        largest = max(tool_sources, key=lambda source: source["cost"])
+        add("tool-result", largest["cost"],
+            f"{largest['tool']} results were carried into later turns.",
+            "Check whether that result could be narrower.",
+            ("Search first, then read the relevant slice instead of loading a whole file, "
+             "directory, or log.",
+             "Ask commands for the smallest useful output: targeted filters, limits, and "
+             "paths beat broad listings."))
+
+    compacted = sources.get("(compaction)", 0)
+    if compacted > 0:
+        add("compaction", compacted,
+            "A compaction summary was carried through the rest of the session.",
+            "If the subject changed, a fresh session is cheaper than compacting it.",
+            ("Use compaction only to continue the same problem with less context, not to "
+             "jump into a different task.",
+             "When the subject changes, start fresh and state only the facts needed for "
+             "the next task."))
+    return findings
+
+
+def triage(session_buckets, table, memo, candidate_limit: int = TRIAGE_SESSION_LIMIT,
+           result_limit: int = TRIAGE_RESULT_LIMIT):
+    """Returns the few costly patterns worth opening a session for.
+
+    This deliberately reads only the most expensive sessions in the window. It is
+    a local shortcut to investigation, not a scoring system, a budget, or an
+    attempt to judge every working habit.
+    """
+    details = []
+    seen = set()
+    for (project, sid), _bucket in sorted(session_buckets.items(),
+                                          key=lambda item: -item[1].cost):
+        if sid in seen:
+            continue
+        seen.add(sid)
+        path = find_transcript(sid)
+        if path is None:
+            continue
+        detail = session_payload(path, table, memo, top=0)
+        if detail is None:
+            continue
+        detail["project"] = os.path.basename(project.rstrip("/")) or detail["project"]
+        detail["triage"] = session_findings(detail)
+        details.append(detail)
+        if len(details) >= candidate_limit:
+            break
+
+    findings = [finding for detail in details for finding in detail["triage"]]
+
+    findings.sort(key=lambda finding: -finding["cost"])
+    chosen = []
+    kinds = set()
+    for unique_kind in (True, False):
+        for finding in findings:
+            if finding in chosen or (unique_kind and finding["kind"] in kinds):
+                continue
+            chosen.append(finding)
+            kinds.add(finding["kind"])
+            if len(chosen) == result_limit:
+                return {"findings": chosen, "scanned": len(details)}
+    return {"findings": chosen, "scanned": len(details)}
 
 
 def _money(value: float) -> str:
@@ -1408,6 +1525,35 @@ def render_context_chart(session: dict) -> str:
     return f'<div class="chart">{"".join(svg)}</div>{legend}'
 
 
+def render_session_triage(session: dict) -> list:
+    """Renders the same investigation leads in the session that produced them."""
+    findings = session.get("triage") or []
+    if not findings:
+        return []
+    out = ["<section class=\"triage\"><div class=\"section-head\">",
+           "<h2>What to inspect in this session</h2>",
+           "<p class=\"note\">The cost attached to each lead is the part of this "
+           "session it explains. Leads appear only from 10% of the session and $0.25; "
+           "use the tables below to trace the precise turn.</p>",
+           "</div>"]
+    out.append('<div class="triage-list">')
+    for rank, finding in enumerate(sorted(findings, key=lambda item: -item["cost"]), 1):
+        out.append(
+            '<article class="triage-item">'
+            f'<span class="triage-rank">{rank:02d}</span>'
+            '<div class="triage-main">'
+            f'<div class="triage-title"><b>${_money(finding["cost"])}</b></div>'
+            f'<p>{html_escape(finding["reason"])}</p>'
+            f'<p class="triage-advice">{html_escape(finding["advice"])}</p>'
+            '<ul class="triage-tips">'
+            + "".join(f'<li>{html_escape(tip)}</li>' for tip in finding["tips"])
+            + "</ul>"
+            "</div></article>")
+    out.append("</div>")
+    out.append("</section>")
+    return out
+
+
 def render_session_detail(session: dict, payload: dict, standalone: bool) -> list:
     """Renders one session: headline figures, per-tool breakdown, turns."""
     esc = html_escape
@@ -1477,6 +1623,9 @@ def render_session_detail(session: dict, payload: dict, standalone: bool) -> lis
         out.append(f'<div class="fact">{eyebrow}'
                    f"<b>{esc(str(value))}</b></div>")
     out.append("</div>")
+
+    if standalone:
+        out += render_session_triage(session)
 
     chart = render_context_chart(session)
     if chart:
@@ -2028,6 +2177,19 @@ def analyze_session(needle: str, table, memo, top: int):
           "growth;\nparallel calls share their delta in proportion to result size.")
 
 
+def print_triage(data: dict, since: datetime | None):
+    period = f" since {since.date()}" if since else ""
+    findings = data.get("findings") or []
+    print(f"\nWhat to inspect{period} — {data.get('scanned', 0)} costly session(s) checked\n")
+    if not findings:
+        print("No costly pattern stood out in the sessions checked.")
+        return
+    for rank, finding in enumerate(findings, 1):
+        print(f"{rank}. ${finding['cost']:,.2f} — {finding['project']} {finding['short']}")
+        print(f"   {finding['reason']}")
+        print(f"   → {finding['advice']}")
+
+
 def statusline(table, memo) -> str:
     """One line for Claude Code's own status bar: today, and the session in front of you.
 
@@ -2185,6 +2347,8 @@ def main():
                              "(parses each transcript, so it is the slow one)")
     parser.add_argument("--tools-max", type=int, default=500, metavar="N",
                         help="cap on the sessions --tools parses (default: 500)")
+    parser.add_argument("--triage", action="store_true",
+                        help="show the few costly patterns worth inspecting")
     parser.add_argument("--project", help="substring filter on the project key")
     parser.add_argument("--session", metavar="ID",
                         help="break down a single session (id prefix or path)")
@@ -2389,6 +2553,12 @@ def main():
 
     if not projects:
         print("No data in this window.")
+        return
+
+    triage_data = triage(sessions, table, memo) if args.triage else None
+
+    if args.triage:
+        print_triage(triage_data, since)
         return
 
     def serialize(bucket: Bucket):
