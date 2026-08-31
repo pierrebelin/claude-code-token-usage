@@ -147,9 +147,9 @@
   }
 
   header { display: flex; flex-direction: column; gap: 20px; }
-  .lede { max-width: 74ch; color: var(--muted); font-size: 15px; margin: 0; }
+  .lede { color: var(--muted); font-size: 15px; margin: 0; }
   section { display: flex; flex-direction: column; gap: 14px; }
-  .note { font-size: 13px; color: var(--muted); margin: 0; max-width: 84ch; }
+  .note { font-size: 13px; color: var(--muted); margin: 0; }
   .note b {
     font-family: var(--mono);
     font-size: .93em;
@@ -257,7 +257,6 @@
     border-left: 2px solid var(--brass);
     border-radius: var(--r-sm);
     padding: 13px 17px;
-    max-width: 92ch;
   }
   .caveat strong { color: var(--ink); font-weight: 600; }
 
@@ -630,27 +629,64 @@
   }
   .identity { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
 
+  /* One row, however many facts there are: equal columns that shrink together.
+     Below 980px they fall back to wrapping so the numbers stay readable. */
   .facts {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(142px, 1fr));
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(0, 1fr);
     gap: 1px;
     background: var(--line);
     border: 1px solid var(--line);
     border-radius: var(--r);
-    overflow: hidden;
     box-shadow: var(--shadow-sm);
+  }
+  /* No overflow:hidden on .facts - it would clip the hover explanations. The
+     rounded corners come from the end cells instead. */
+  .fact:first-child {
+    border-top-left-radius: var(--r);
+    border-bottom-left-radius: var(--r);
+  }
+  .fact:last-child {
+    border-top-right-radius: var(--r);
+    border-bottom-right-radius: var(--r);
+  }
+  @media (max-width: 980px) {
+    .facts {
+      grid-auto-flow: row;
+      grid-template-columns: repeat(auto-fit, minmax(142px, 1fr));
+    }
   }
   .fact {
     background: var(--surface);
-    padding: 14px 16px;
+    padding: 14px 13px;
     display: flex;
     flex-direction: column;
     gap: 5px;
+    min-width: 0;
   }
+  /* Labels wrap onto a second line rather than being clipped in a narrow column;
+     the value stays bottom-aligned across the row thanks to .fact b margin-top. */
+  .fact .eyebrow { letter-spacing: .1em; line-height: 1.35; }
+  /* Each fact explains itself on hover, like the table headers. It opens
+     downwards: the facts sit under the hero, where there is no room above. */
+  .fact .src::after {
+    bottom: auto;
+    top: calc(100% + 10px);
+    transform: translateY(-4px);
+    z-index: 6;
+    text-transform: none;
+    letter-spacing: 0;
+    font-weight: 400;
+    color: var(--ink);
+  }
+  .fact .src:hover::after, .fact .src:focus-visible::after { transform: none; }
+  /* The rightmost facts anchor their tooltip to the right, to stay on the page. */
+  .facts .fact:nth-last-child(-n+3) .src::after { left: auto; right: -12px; }
   .fact b {
     font-family: var(--mono);
     font-weight: 600;
-    font-size: 16px;
+    font-size: 15px;
     letter-spacing: -.02em;
     font-variant-numeric: tabular-nums;
     margin-top: auto;
@@ -714,7 +750,6 @@
   td.label {
     white-space: normal;
     min-width: 250px;
-    max-width: 460px;
     color: var(--muted);
   }
   .swatch {
@@ -771,6 +806,26 @@
     top: calc(100% + 12px);
     transform: translateY(-4px);
   }
+  /* Column headers explain themselves the same way; theirs always drops below,
+     and the right-aligned numeric ones anchor to their right edge. */
+  thead .src {
+    color: inherit;
+    font: inherit;
+    letter-spacing: inherit;
+    text-transform: inherit;
+  }
+  thead .src::after {
+    bottom: auto;
+    top: calc(100% + 10px);
+    transform: translateY(-4px);
+    z-index: 6;
+    color: var(--ink);
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  thead th.n .src::after { left: auto; right: -12px; }
+  thead .src:hover::after, thead .src:focus-visible::after { transform: none; }
 
   footer {
     font-family: var(--mono);

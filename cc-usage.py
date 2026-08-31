@@ -485,7 +485,7 @@ def attribute(chain, results):
                       if i == 0 else "Resume after compaction")
             carried = segment_end[i] - i + 1
             entries.append({"turn": i, "label": source, "tool": "(startup)",
-                            "added": added, "carried": carried})
+                            "added": added, "carried": carried, "ctx": turn.ctx})
             continue
         previous = chain[i - 1]
         added = turn.ctx - previous.ctx - previous.output
@@ -498,10 +498,12 @@ def attribute(chain, results):
             for tid, (name, tool_input) in previous.tools.items():
                 share = added * sizes[tid] / total
                 entries.append({"turn": i, "label": describe_tool(name, tool_input),
-                                "tool": name, "added": share, "carried": carried})
+                                "tool": name, "added": share, "carried": carried,
+                                "ctx": turn.ctx})
         else:
             entries.append({"turn": i, "label": "User prompt / system context",
-                            "tool": "(no tool)", "added": added, "carried": carried})
+                            "tool": "(no tool)", "added": added, "carried": carried,
+                            "ctx": turn.ctx})
     return entries
 
 
@@ -509,7 +511,7 @@ TURN_SORTS = {
     "cost-desc": ("Costliest first", lambda e: (-e["cost"], e["turn"])),
     "cost-asc": ("Cheapest first", lambda e: (e["cost"], e["turn"])),
     "added-desc": ("Tokens added", lambda e: (-e["added"], e["turn"])),
-    "carried-desc": ("Most carried", lambda e: (-e["carried"], e["turn"])),
+    "context-desc": ("Largest context", lambda e: (-e["ctx"], e["turn"])),
     "turn-asc": ("Chronological", lambda e: e["turn"]),
     "turn-desc": ("Reverse order", lambda e: -e["turn"]),
 }
@@ -600,6 +602,14 @@ def session_payload(path: Path, table, memo, top: int = 15,
             e["cost"] *= scale
         total_in *= scale
         total_out *= scale
+    # The three input counters the API itself bills on, summed over the session.
+    billed = {"fresh": 0, "cache_read": 0, "cache_write": 0}
+    for turn in turns:
+        usage = turn.usage or {}
+        billed["fresh"] += int(usage.get("input_tokens") or 0)
+        billed["cache_read"] += int(usage.get("cache_read_input_tokens") or 0)
+        billed["cache_write"] += int(usage.get("cache_creation_input_tokens") or 0)
+    billed["total"] = sum(billed.values())
     grouped = defaultdict(lambda: {"added": 0.0, "cost": 0.0, "count": 0})
     for e in entries:
         g = grouped[e["tool"]]
@@ -620,7 +630,7 @@ def session_payload(path: Path, table, memo, top: int = 15,
             skills[turn.skill] += (input_cost(turn.usage, rates)
                                    + turn.output * (rates.output if rates else 0.0)) * scale
     rows = [{"turn": e["turn"], "label": _short(e["label"], 64), "tool": e["tool"],
-             "added": int(e["added"]), "carried": e["carried"], "cost": round(e["cost"], 4)}
+             "added": int(e["added"]), "ctx": e["ctx"], "cost": round(e["cost"], 4)}
             for e in entries]
     needle = turn_filter.lower().strip()
     if needle:
@@ -639,6 +649,8 @@ def session_payload(path: Path, table, memo, top: int = 15,
         "prompts": prompts,
         "compactions": compactions,
         "context_final": main[-1].ctx,
+        "context_peak": max(t.ctx for t in main),
+        "billed": billed,
         "output": sum(t.output for t in turns),
         "cost": round(total_in + total_out, 4),
         "cost_context": round(total_in, 4),
@@ -729,6 +741,65 @@ def source_tip(tool: str, count: int) -> str:
     call = "call" if count == 1 else "calls"
     return (f"What {tool} returned, over {count} {call}. Cost = tokens added \u00d7 the "
             "number of later turns that carried them.")
+
+
+COLUMN_TIPS = {
+    "Source": "Where the tokens came from: one tool, or a pseudo-source for the "
+              "startup context, your own prompts, and Claude's output.",
+    "Calls": "How many times this source appeared in the session.",
+    "Tokens added": "The new tokens this source pushed into the context, before any "
+                    "multiplication by the turns that carry them.",
+    "Tokens": "The new tokens this turn added to the context \u2014 its own size, not "
+              "the running total.",
+    "Turn": "Position of the turn in the session, oldest first.",
+    "What the turn added": "The tool call, or the kind of message, that grew the "
+                           "context on this turn.",
+    "Context": "The context the API measured on that turn: everything replayed, plus "
+               "what this turn added. This is a read number, not an estimate.",
+    "Avg call": "Tokens added per call \u2014 a source can be expensive because each "
+                "call is huge, or because it is called constantly.",
+    "Cost": "The share of the session's measured input cost attributed to this line: "
+            "tokens added, weighted by the turns that replay them. Attribution is a "
+            "model; only the session total is measured.",
+    "Share": "This line's part of the session's total cost.",
+}
+
+
+FACT_TIPS = {
+    "Context": "What the input tokens cost: the whole context, replayed on every turn, "
+               "at cache and full rates. Usually the larger half of a session.",
+    "Generation": "What Claude's own output cost. Billed once, never replayed.",
+    "Input tokens billed": "Every input token the API charged for, over the session: "
+                           "uncached, cache writes and cache reads added together. It "
+                           "dwarfs the context size because each turn resends the lot.",
+    "Served from cache": "Share of those input tokens that came from the prompt cache, "
+                         "at about a tenth of the input rate. A low figure means "
+                         "something changes the prefix and invalidates the cache.",
+    "Written to cache": "Tokens written into the cache, at about 1.25\u00d7 the input "
+                        "rate. Paid once per new prefix, repaid by the next turn that "
+                        "reads it back.",
+    "Uncached input": "Input tokens charged at the full rate \u2014 never cached, or "
+                      "expired from the cache before the next turn.",
+    "Tokens produced": "Output tokens generated over the session, thinking included.",
+    "Peak context": "The largest context the API measured on a single turn \u2014 the "
+                    "high-water mark, which a compaction resets.",
+    "Accounted for by transcript": "How much of Claude Code's own cost counter this "
+                                   "page's breakdown adds up to. Below 100 % means the "
+                                   "transcript does not carry every billed turn.",
+    "Internal counter": "No cost-state entry in this transcript, so the total is a "
+                        "floor rebuilt from the turns rather than a figure Claude Code "
+                        "itself recorded.",
+}
+
+
+def _th(label: str, numeric: bool = False) -> str:
+    """A column header that explains itself on hover, reusing the .src tooltip."""
+    tip = COLUMN_TIPS.get(label)
+    cell = '<th class="n">' if numeric else "<th>"
+    if not tip:
+        return f"{cell}{html_escape(label)}</th>"
+    return (f'{cell}<span class="src" tabindex="0" data-tip="{html_escape(tip)}">'
+            f"{html_escape(label)}</span></th>")
 
 
 def _shade(index: int, count: int) -> str:
@@ -829,17 +900,30 @@ def render_session_detail(session: dict, payload: dict, standalone: bool) -> lis
         out.append('<div class="hero-meta">' + "".join(run) + "</div>")
         out.append("</header>")
 
+    billed = session.get("billed") or {}
+    billed_total = billed.get("total") or 0
     facts = [
         ("Context", "$" + _money(session["cost_context"])),
         ("Generation", "$" + _money(session["cost_output"])),
+        ("Input tokens billed", _tokens(billed_total)),
+        ("Served from cache",
+         f'{round(100 * billed.get("cache_read", 0) / billed_total)} %'
+         if billed_total else "\u2014"),
+        ("Written to cache", _tokens(billed.get("cache_write", 0))),
+        ("Uncached input", _tokens(billed.get("fresh", 0))),
         ("Tokens produced", _tokens(session["output"])),
-        ("Final context", _tokens(session["context_final"])),
+        ("Peak context", _tokens(session.get("context_peak")
+                                 or session["context_final"])),
         (("Accounted for by transcript", f'{session["restitution"]} %')
          if session["exact"] else ("Internal counter", "missing")),
     ]
     out.append('<div class="facts">')
     for label, value in facts:
-        out.append(f'<div class="fact"><span class="eyebrow">{esc(label)}</span>'
+        tip = FACT_TIPS.get(label)
+        eyebrow = (f'<span class="eyebrow src" tabindex="0" data-tip="{esc(tip)}">'
+                   f"{esc(label)}</span>" if tip
+                   else f'<span class="eyebrow">{esc(label)}</span>')
+        out.append(f'<div class="fact">{eyebrow}'
                    f"<b>{esc(str(value))}</b></div>")
     out.append("</div>")
 
@@ -851,7 +935,9 @@ def render_session_detail(session: dict, payload: dict, standalone: bool) -> lis
         out.append("<h2>What filled the context</h2>")
         out.append('<p class="note">Every turn resends the whole accumulated context, '
                    "so a source costs its own size multiplied by the number of later "
-                   "turns that carry it. Hover a source to see what it covers.</p>")
+                   "turns that carry it \u2014 an attribution, where the session total "
+                   "above is measured. Hover any source or column header for what it "
+                   "means.</p>")
         out.append("</div>")
     else:
         out.append("<h2>What filled the context</h2>")
@@ -861,10 +947,11 @@ def render_session_detail(session: dict, payload: dict, standalone: bool) -> lis
         out.append(f'<span style="width:{share:.2f}%;background:{_shade(i, len(sources))}" '
                    f'title="{esc(src["tool"])} — ${_money(src["cost"])}"></span>')
     out.append("</div>")
-    out.append('<div class="scroll"><table><thead><tr><th>Source</th>'
-               '<th class="n">Calls</th><th class="n">Tokens added</th>'
-               '<th class="n">Cost</th><th class="n">Share</th>'
-               "</tr></thead><tbody>")
+    out.append('<div class="scroll"><table><thead><tr>'
+               + _th("Source") + _th("Calls", numeric=True)
+               + _th("Tokens added", numeric=True) + _th("Avg call", numeric=True)
+               + _th("Cost", numeric=True) + _th("Share", numeric=True)
+               + "</tr></thead><tbody>")
     for i, src in enumerate(sources):
         share = round((src["cost"] / total_sources) * 100)
         out.append(
@@ -874,6 +961,7 @@ def render_session_detail(session: dict, payload: dict, standalone: bool) -> lis
             f'{esc(src["tool"])}</span></td>'
             f'<td class="n">{src["count"]}</td>'
             f'<td class="n">{_tokens(src["added"])}</td>'
+            f'<td class="n">{_tokens(src["added"] / max(1, src["count"]))}</td>'
             f'<td class="n">${_money(src["cost"])}</td>'
             f'<td class="n">{share} %</td></tr>')
     out.append("</tbody></table></div>")
@@ -885,17 +973,20 @@ def render_session_detail(session: dict, payload: dict, standalone: bool) -> lis
         out.append(f'<div class="filters">{_turn_form(payload, action="/session")}</div>')
     rows = session["entries"]
     if rows:
-        out.append('<div class="scroll"><table><thead><tr><th class="n">Turn</th>'
-                   '<th>What the turn added</th><th class="n">Tokens</th>'
-                   '<th class="n">Carried</th><th class="n">Cost</th>'
-                   "</tr></thead><tbody>")
+        turn_total = sum(e["cost"] for e in rows) or 1
+        out.append('<div class="scroll"><table><thead><tr>'
+                   + _th("Turn", numeric=True) + _th("What the turn added")
+                   + _th("Tokens", numeric=True) + _th("Context", numeric=True)
+                   + _th("Cost", numeric=True) + _th("Share", numeric=True)
+                   + "</tr></thead><tbody>")
         for entry in rows:
             out.append(
                 f'<tr><td class="n">{entry["turn"]}</td>'
                 f'<td class="label" title="{esc(entry["label"])}">{esc(entry["label"])}</td>'
                 f'<td class="n">{_tokens(entry["added"])}</td>'
-                f'<td class="n">×{entry["carried"]}</td>'
-                f'<td class="n">${_money(entry["cost"])}</td></tr>')
+                f'<td class="n">{_tokens(entry["ctx"])}</td>'
+                f'<td class="n">${_money(entry["cost"])}</td>'
+                f'<td class="n">{round(100 * entry["cost"] / turn_total)} %</td></tr>')
         out.append("</tbody></table></div>")
         total_rows = session.get("entries_total", len(rows))
         if total_rows > len(rows):
@@ -1272,22 +1363,24 @@ def analyze_session(needle: str, table, memo, top: int):
     grand = sum(g["cost"] for _, g in ranked) + total_out or 1
     print("\nWhat filled the context — cost = tokens added x turns that carry them\n")
     rows = [
-        [tool, str(g["count"]), human(int(g["added"])), f"{g['cost']:,.2f}",
+        [tool, str(g["count"]), human(int(g["added"])),
+         human(int(g["added"] / max(1, g["count"]))), f"{g['cost']:,.2f}",
          f"{100 * g['cost'] / grand:.0f}%"]
         for tool, g in ranked
     ]
     rows.append(["(response generation)", str(len(turns)),
-                 human(sum(t.output for t in turns)), f"{total_out:,.2f}",
-                 f"{100 * total_out / grand:.0f}%"])
-    render_table(["Source", "Calls", "Tokens added", "Cost $", "Share"],
-                 rows, ["l", "r", "r", "r", "r"])
+                 human(sum(t.output for t in turns)),
+                 human(sum(t.output for t in turns) // max(1, len(turns))),
+                 f"{total_out:,.2f}", f"{100 * total_out / grand:.0f}%"])
+    render_table(["Source", "Calls", "Tokens added", "Avg call", "Cost $", "Share"],
+                 rows, ["l", "r", "r", "r", "r", "r"])
 
     print(f"\n{top} costliest individual additions\n")
     render_table(
-        ["Turn", "What was added", "Tokens", "Carried", "Cost $"],
+        ["Turn", "What was added", "Tokens", "Context", "Cost $"],
         [
             [str(e["turn"]), _short(e["label"]), human(int(e["added"])),
-             f"x{e['carried']}", f"{e['cost']:,.2f}"]
+             human(e["ctx"]), f"{e['cost']:,.2f}"]
             for e in sorted(entries, key=lambda x: -x["cost"])[:top]
         ],
         ["r", "l", "r", "r", "r"],
