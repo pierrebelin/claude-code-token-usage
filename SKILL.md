@@ -19,6 +19,8 @@ one without the other breaks `--dashboard`.
 - "what filled the context of this session"
 - "why was this session so expensive"
 - before optimising a CLAUDE.md, a skill, or an expensive working habit
+- "did that week produce anything" — what landed in git against what it cost
+- "what did this session waste" — a grade per session, A to F, and what weighs on it
 
 ## Commands
 
@@ -37,6 +39,12 @@ python3 $SKILL/cc-usage.py --days 30 --tools
 # three costly patterns worth opening next
 python3 $SKILL/cc-usage.py --days 7 --triage
 
+# what those sessions left in git: landed, reverted, never merged, no commit
+python3 $SKILL/cc-usage.py --days 30 --yield
+
+# every session in the window graded A to F on what it could have avoided
+python3 $SKILL/cc-usage.py --days 30 --audit
+
 # live dashboard, recomputed on every load
 python3 $SKILL/cc-usage.py --serve
 
@@ -46,6 +54,7 @@ python3 $SKILL/cc-usage.py --days 30 --dashboard ~/.claude/usage/report.html
 
 Options: `--days` / `--since`, `--project <substring>`, `--by repo|cwd|dir`,
 `--split-worktrees`, `--models`, `--sessions N`, `--daily`, `--tools` / `--tools-max N`, `--triage`,
+`--yield` / `--yield-max N`, `--audit` / `--audit-max N`, `--no-git`,
 `--top N`, `--json`, `--no-cost-state`, `--no-fetch`, `--statusline`.
 
 `--tools` is the one to reach for when the question is about a habit rather than a
@@ -59,10 +68,11 @@ Dashboard sorting and filtering: `--sort-sessions date-desc|date-asc|cost-desc|c
 `--filter-turns <text>` (tool or label), `--sessions-max N`, `--focus <prefix>`
 (with `--dashboard`, writes the page for a single session).
 
-In `--serve` mode the home page carries the overview and the session list; each row opens
-`/session?id=...`, which reads a single transcript (~0.1 s), starts with its own
-improvement leads, then unrolls every turn. A lead appears only from 10% of that session
-and $0.25, so small categories do not turn into noise.
+In `--serve` mode the home page carries the overview and the session list; each row shows
+that session's grade and opens `/session?id=...`, which reads a single transcript
+(~0.1 s), starts with the grade and the leads behind it, then unrolls every turn. A lead
+appears from 10% of that session and $0.25, or from $0.25 alone when it is unambiguous
+waste, so small categories do not turn into noise.
 In a frozen page everything fits in one file: the list points at internal anchors. In `--serve`
 mode, two GET forms expose the same settings and the state lives in the URL
 (`?days=30&sort=date-desc&q=backend&tsort=turn-asc&tq=Read`): shareable, reloadable,
@@ -107,6 +117,26 @@ them.
 pause the next turn rewrites the whole prefix at the write rate instead of reading it back
 at a tenth of it. The script reports those turns, the tokens rewritten and the avoidable
 cost. It is the one finding a user can act on without changing how they work — only when.
+
+**`--yield` answers "for what", not "how much".** It correlates each session with the
+commits its repo received while it ran — two minutes before the first turn to half an hour
+after the last — then reads the outcome off git: landed on the mainline, reverted
+afterwards, committed but never merged, or no commit at all. A commit is attributed to the
+last session still running when it was authored, so overlapping sessions never bank the
+same work. Never present `no commit` as waste: reading, debugging and planning sessions end
+that way. The figure that means something is how much of the bill sits in that category
+week after week, and whether it moves.
+
+**`--audit` grades sessions, one by one.** There is no machine-wide score: a letter A to
+F belongs to a run. It measures what that run could have avoided — junk or duplicate
+reads, a cache rebuilt after an idle gap, a compaction carried to the end, replies
+replayed past a fifth of the bill, instructions past 8 kB priced against the `(startup)`
+cost measured on that session — as a **share of what the session cost**, never its size.
+A long, expensive session that wasted nothing scores A, and saying otherwise is the one
+mistake to avoid when reporting a grade. Subagents and a heavy tool result appear as
+leads but weigh nothing: they are worth opening, not faults. Findings under a couple of
+dollars are damped, because a bad rate on small change is not a problem to act on. The
+dashboard needs no flag for any of this — the letter is on every row of the session list.
 
 **Do not confuse re-reading with waste.** A re-read after a compaction is legitimate, the
 context was emptied. A `Read` with `offset`/`limit` is a partial read, not a duplicate.
