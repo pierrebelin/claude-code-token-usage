@@ -9,6 +9,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import subprocess
 import sys
 import time
 import urllib.request
@@ -464,6 +466,34 @@ def describe_tool(name, tool_input):
     return name
 
 
+READ_TOOLS = {"Read", "NotebookRead", "Glob", "Grep", "Edit", "Write", "MultiEdit",
+              "NotebookEdit"}
+
+
+def tool_target(name, tool_input) -> str:
+    """The file a call points at, kept whole: the audit needs the path, not a label."""
+    if name not in READ_TOOLS or not isinstance(tool_input, dict):
+        return ""
+    for field in ("file_path", "path", "notebook_path"):
+        value = tool_input.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+_COMMAND_RE = re.compile(r"<command-name>/?([\w:-]+)</command-name>")
+
+
+def slash_commands(content) -> set:
+    """Slash commands named in one user message, as Claude Code writes them down."""
+    if isinstance(content, list):
+        content = " ".join(block.get("text") or "" for block in content
+                           if isinstance(block, dict) and block.get("type") == "text")
+    if not isinstance(content, str) or "<command-name>" not in content:
+        return set()
+    return {match.group(1) for match in _COMMAND_RE.finditer(content)}
+
+
 def subagent_dir(transcript: Path) -> Path:
     """Claude Code writes each subagent to its own transcript, one level down.
 
@@ -522,8 +552,9 @@ def read_session(path: Path, with_subagents: bool = True):
     launched: dict[str, dict] = {}
     cwds: Counter = Counter()
     branches: Counter = Counter()
+    commands: set = set()
     meta = {"cwd": "", "branch": "", "session": path.stem, "reported": None,
-            "compact_mids": compact_mids, "agents": []}
+            "compact_mids": compact_mids, "agents": [], "commands": commands}
     for line in path.open(encoding="utf-8", errors="replace"):
         try:
             entry = json.loads(line)
@@ -557,6 +588,7 @@ def read_session(path: Path, with_subagents: bool = True):
                                 "model": raw.get("resolvedModel") or "",
                             }
                     results[block.get("tool_use_id") or ""] = size
+            commands |= slash_commands(content)
             if not has_result and not entry.get("isMeta"):
                 prompts += 1
             continue
@@ -751,11 +783,13 @@ def attribute(chain, results, compact_mids=()):
     """
     n = len(chain)
     segment_end = [n - 1] * n
+    segment_of = [0] * n
     starts, flagged = segment_starts(chain, compact_mids)
     for pos, start in enumerate(starts):
         end = starts[pos + 1] - 1 if pos + 1 < len(starts) else n - 1
         for i in range(start, end + 1):
             segment_end[i] = end
+            segment_of[i] = pos
 
     entries = []
     for i, turn in enumerate(chain):
@@ -765,7 +799,8 @@ def attribute(chain, results, compact_mids=()):
                     else "(compaction)" if i in flagged else "(context reset)")
             carried = segment_end[i] - i + 1
             entries.append({"turn": i, "label": SEGMENT_LABELS[tool], "tool": tool,
-                            "added": added, "carried": carried, "ctx": turn.ctx})
+                            "added": added, "carried": carried, "ctx": turn.ctx,
+                            "segment": segment_of[i], "target": ""})
             continue
         previous = chain[i - 1]
         carried = segment_end[i] - i + 1
@@ -775,7 +810,8 @@ def attribute(chain, results, compact_mids=()):
             # generation, then again at the input rate for as long as it is carried.
             entries.append({"turn": i, "label": "Claude's reply, resent as context",
                             "tool": "(replayed output)", "added": previous.output,
-                            "carried": carried, "ctx": turn.ctx})
+                            "carried": carried, "ctx": turn.ctx,
+                            "segment": segment_of[i], "target": ""})
         added = turn.ctx - previous.ctx - previous.output
         if added == 0:
             continue
@@ -786,11 +822,14 @@ def attribute(chain, results, compact_mids=()):
                 share = added * sizes[tid] / total
                 entries.append({"turn": i, "label": describe_tool(name, tool_input),
                                 "tool": name, "added": share, "carried": carried,
-                                "ctx": turn.ctx})
+                                "ctx": turn.ctx, "segment": segment_of[i],
+                                "target": tool_target(name, tool_input),
+                                "partial": isinstance(tool_input, dict) and bool(
+                                    tool_input.get("offset") or tool_input.get("limit"))})
         else:
             entries.append({"turn": i, "label": "User prompt / system context",
                             "tool": "(no tool)", "added": added, "carried": carried,
-                            "ctx": turn.ctx})
+                            "ctx": turn.ctx, "segment": segment_of[i], "target": ""})
     return entries
 
 
@@ -808,6 +847,108 @@ TRIAGE_SESSION_LIMIT = 12
 TRIAGE_RESULT_LIMIT = 3
 SESSION_FINDING_MIN_SHARE = 0.10
 SESSION_FINDING_MIN_COST = 0.25
+
+# A grade reads one session, never the machine, and only the part of that run
+# which could have been avoided: junk loaded into context, the same file read
+# twice, a cache rebuilt after a pause, a compaction carried to the end, replies
+# replayed long after they mattered. Each weight is a share of what the session
+# itself cost, so a $2 run and a $200 run are graded on the same scale, and an
+# expensive session is never penalised for being expensive.
+GRADE_BANDS = ((3, "A"), (8, "B"), (15, "C"), (24, "D"))
+# kind -> factor applied to that share, cap, and the share below which it is free
+GRADE_WEIGHTS = {
+    "junk-reads": (1.2, 25.0, 0.0),
+    "duplicate-reads": (1.2, 20.0, 0.0),
+    "cache": (1.0, 20.0, 0.0),
+    "compaction": (1.0, 15.0, 0.0),
+    "replayed-output": (0.6, 15.0, 20.0),
+}
+# Below this, a share is still a share but there is nothing to act on: forty
+# cents rebuilt in a one-dollar session is a rate, not a problem. The weight
+# fades in up to it rather than landing whole.
+GRADE_MATERIAL = 2.0
+CLAUDE_MD_LIMIT = 8_000        # bytes, resent on every turn of every session
+JUNK_FRAGMENTS = ("/node_modules/", "/.git/", "/dist/", "/build/", "/.next/",
+                  "/target/", "/vendor/", "/.venv/", "/site-packages/",
+                  "/coverage/", "/__pycache__/", "/.terraform/", "/Pods/",
+                  "/.pytest_cache/", "/.mypy_cache/")
+JUNK_NAMES = ("package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
+              "Cargo.lock", "composer.lock", "Gemfile.lock", ".min.js", ".min.css",
+              ".js.map", ".css.map")
+
+
+def is_junk(path: str) -> bool:
+    """A path whose content is generated, vendored or locked: never worth context."""
+    lowered = path.replace("\\", "/")
+    return (any(fragment in lowered for fragment in JUNK_FRAGMENTS)
+            or lowered.endswith(JUNK_NAMES))
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def claude_md_chain(path: Path, depth: int = 0, seen: set | None = None) -> list:
+    """A CLAUDE.md and the files it pulls in, since an @-import is paid like the rest."""
+    seen = set() if seen is None else seen
+    key = str(path)
+    if depth > 3 or key in seen or not path.is_file():
+        return []
+    seen.add(key)
+    text = _read_text(path)
+    files = [{"path": key, "bytes": len(text.encode("utf-8"))}]
+    for line in text.splitlines():
+        token = line.strip().split(" ", 1)[0]
+        if not token.startswith("@") or len(token) < 2:
+            continue
+        target = Path(token[1:]).expanduser()
+        if not target.is_absolute():
+            target = path.parent / target
+        files += claude_md_chain(target, depth + 1, seen)
+    return files
+
+
+_INSTRUCTIONS: dict[str, list] = {}
+
+
+def instruction_chain(cwd: str) -> list:
+    """The CLAUDE.md files a session run from `cwd` carried on every one of its turns.
+
+    The user's file and the project's are both loaded, and an @-import is paid
+    like the rest of the file, so what counts is the chain rather than one path.
+    """
+    if cwd in _INSTRUCTIONS:
+        return _INSTRUCTIONS[cwd]
+    seen: set = set()
+    chain = claude_md_chain(Path.home() / ".claude" / "CLAUDE.md", seen=seen)
+    if cwd:
+        base = Path(cwd)
+        for parent in (base, *list(base.parents)[:5]):
+            chain += claude_md_chain(parent / "CLAUDE.md", seen=seen)
+    _INSTRUCTIONS[cwd] = chain
+    return chain
+
+
+def grade_for(score: float) -> str:
+    for ceiling, letter in GRADE_BANDS:
+        if score < ceiling:
+            return letter
+    return "F"
+
+
+def grade_weight(kind: str, share: float, cost: float) -> float:
+    """What one finding costs the grade: its share of the session, weighted."""
+    factor, cap, free = GRADE_WEIGHTS.get(kind, (0.0, 0.0, 0.0))
+    material = min(1.0, cost / GRADE_MATERIAL)
+    return min(cap, factor * max(0.0, share - free)) * material
+
+
+def grade_session(detail: dict) -> tuple:
+    score = sum(finding["weight"] for finding in detail.get("triage") or [])
+    return round(score, 1), grade_for(score)
 
 SESSION_SORTS = {
     "cost-desc": "Costliest first",
@@ -940,6 +1081,50 @@ def session_payload(path: Path, table, memo, top: int = 15,
                         "added": sum(a["output"] for a in agents),
                         "cost": round(agents_cost, 4)})
     sources.sort(key=lambda src: -src["cost"])
+
+    # Per-file view of the same attribution, for the setup audit: which paths were
+    # loaded, at what cost, and how often the same one came back inside a single
+    # segment. A read after a compaction or a rewind opens a new segment, so it is
+    # not counted as a repeat, and neither is a partial read with an offset.
+    files: dict[str, dict] = {}
+    repeats: Counter = Counter()
+    for e in entries:
+        target = e.get("target")
+        if not target:
+            continue
+        row = files.setdefault(target, {"path": target, "reads": 0, "edits": 0,
+                                        "cost": 0.0, "added": 0.0, "repeats": 0})
+        if e["tool"] in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+            row["edits"] += 1
+        else:
+            row["reads"] += 1
+            if not e.get("partial"):
+                repeats[(target, e["segment"])] += 1
+        row["cost"] += e["cost"]
+        row["added"] += e["added"]
+    for (target, _segment), seen in repeats.items():
+        if seen > 1:
+            files[target]["repeats"] += seen - 1
+    ranked_files = [{**row, "cost": round(row["cost"], 4), "added": int(row["added"])}
+                    for row in sorted(files.values(), key=lambda r: -r["cost"])[:60]]
+    junk_rows = sorted((row for row in files.values()
+                        if row["reads"] and is_junk(row["path"])),
+                       key=lambda row: -row["cost"])
+    dupe_rows = sorted((row for row in files.values()
+                        if row["repeats"] and row["reads"]),
+                       key=lambda row: -row["cost"] * row["repeats"] / row["reads"])
+    waste = {
+        "junk": {"cost": round(sum(row["cost"] for row in junk_rows), 4),
+                 "reads": sum(row["reads"] for row in junk_rows),
+                 "items": [f"{os.path.basename(row['path'])} — ${_money(row['cost'])}"
+                           for row in junk_rows[:4]]},
+        "dupes": {"cost": round(sum(row["cost"] * row["repeats"] / row["reads"]
+                                    for row in dupe_rows), 4),
+                  "repeats": sum(row["repeats"] for row in dupe_rows),
+                  "items": [f"{os.path.basename(row['path'])} — {row['repeats']}×"
+                            for row in dupe_rows[:4]]},
+    }
+
     skills = defaultdict(float)
     for turn in turns:
         if turn.skill:
@@ -976,6 +1161,7 @@ def session_payload(path: Path, table, memo, top: int = 15,
         "id": path.stem,
         "short": path.stem[:8],
         "project": os.path.basename((meta["cwd"] or "").rstrip("/")) or "?",
+        "cwd": meta["cwd"] or "",
         "branch": meta["branch"],
         "start": main[0].ts,
         "end": main[-1].ts,
@@ -999,10 +1185,14 @@ def session_payload(path: Path, table, memo, top: int = 15,
         "sources": sources,
         "skills": [{"name": k, "cost": round(v, 4)} for k, v in
                    sorted(skills.items(), key=lambda kv: -kv[1])],
+        "files": ranked_files,
+        "waste": waste,
+        "commands": sorted(meta["commands"]),
         "entries": kept[:top],
         "entries_total": len(kept),
     }
     payload["triage"] = session_findings(payload)
+    payload["score"], payload["grade"] = grade_session(payload)
     return payload
 
 
@@ -1060,16 +1250,27 @@ def aggregate_sources(session_ids, table, memo, limit: int | None = None):
 
 
 def session_findings(detail: dict):
-    """Returns the actionable patterns found in one already-parsed session."""
+    """Returns the actionable patterns found in one already-parsed session.
+
+    Each one carries a weight, and their sum is the session's grade. Only what
+    the run could have avoided weighs: a large subagent bill or a heavy tool
+    result is a lead worth opening, not a fault, and scores zero.
+    """
     findings = []
 
-    def add(kind: str, cost: float, reason: str, advice: str, tips: tuple[str, str]):
-        threshold = max(SESSION_FINDING_MIN_COST,
-                        detail["cost"] * SESSION_FINDING_MIN_SHARE)
+    def add(kind: str, cost: float, reason: str, advice: str, tips: tuple,
+            items=(), weight: float | None = None, floor: float | None = None):
+        threshold = floor if floor is not None else max(
+            SESSION_FINDING_MIN_COST, detail["cost"] * SESSION_FINDING_MIN_SHARE)
         if cost < threshold:
             return
+        share = 100 * cost / max(detail["cost"], 0.0001)
         findings.append({"kind": kind, "cost": round(cost, 4),
+                         "share": round(share, 1),
+                         "weight": round(grade_weight(kind, share, cost)
+                                         if weight is None else weight, 2),
                          "reason": reason, "advice": advice, "tips": tips,
+                         "items": list(items),
                          "id": detail["id"], "short": detail["short"],
                          "project": detail["project"]})
 
@@ -1124,6 +1325,53 @@ def session_findings(detail: dict):
              "jump into a different task.",
              "When the subject changes, start fresh and state only the facts needed for "
              "the next task."))
+
+    # The three below are unambiguous: no share threshold, only the cost floor.
+    # A quarter of context spent on a lock file is worth naming in a $200 session
+    # exactly as much as in a $3 one.
+    waste = detail.get("waste") or {}
+    junk = waste.get("junk") or {}
+    if junk.get("cost", 0) > 0:
+        add("junk-reads", junk["cost"],
+            f"{_count(junk['reads'], 'read')} of generated, vendored or locked files "
+            "were loaded into context.",
+            "Point the read at the source file rather than at its build product.",
+            ("Lock files, bundles and dependency trees answer almost nothing and are "
+             "carried by every later turn.",
+             "When a dependency really is the question, read the one file inside it "
+             "rather than the directory."),
+            junk["items"], floor=SESSION_FINDING_MIN_COST)
+
+    dupes = waste.get("dupes") or {}
+    if dupes.get("cost", 0) > 0:
+        add("duplicate-reads", dupes["cost"],
+            f"{_count(dupes['repeats'], 'repeat read')} of a file already in this "
+            "context. Reads after a compaction or a rewind, and partial reads with an "
+            "offset, are not counted here.",
+            "The file is already in context: ask for the part that changed rather than "
+            "the file again.",
+            ("A re-read costs its whole size again, and every later turn carries both "
+             "copies.",
+             "After an edit, the diff is what changed \u2014 the file does not have to "
+             "come back whole."),
+            dupes["items"], floor=SESSION_FINDING_MIN_COST)
+
+    chain = [spec for spec in instruction_chain(detail.get("cwd") or "")
+             if spec["bytes"]]
+    size = sum(spec["bytes"] for spec in chain)
+    if size > CLAUDE_MD_LIMIT:
+        add("instructions", sources.get("(startup)", 0),
+            f"Instructions total {size / 1000:.1f} kB, resent on every turn of every "
+            "session. Startup \u2014 system prompt, instructions and tool definitions "
+            "\u2014 is what that cost here.",
+            "Keep the standing rules; move the rest to files Claude opens when it "
+            "needs them.",
+            ("A CLAUDE.md is read on every turn, whether or not the turn needs it.",
+             "Rules that apply to one directory belong in that directory, not in the "
+             "file every session loads."),
+            [f"{spec['path']} \u2014 {spec['bytes'] / 1000:.1f} kB" for spec in chain[:4]],
+            weight=min(8.0, 4.0 * (size / CLAUDE_MD_LIMIT - 1)),
+            floor=SESSION_FINDING_MIN_COST)
     return findings
 
 
@@ -1150,6 +1398,7 @@ def triage(session_buckets, table, memo, candidate_limit: int = TRIAGE_SESSION_L
             continue
         detail["project"] = os.path.basename(project.rstrip("/")) or detail["project"]
         detail["triage"] = session_findings(detail)
+        detail["score"], detail["grade"] = grade_session(detail)
         details.append(detail)
         if len(details) >= candidate_limit:
             break
@@ -1170,8 +1419,207 @@ def triage(session_buckets, table, memo, candidate_limit: int = TRIAGE_SESSION_L
     return {"findings": chosen, "scanned": len(details)}
 
 
+GIT_LEAD_SECONDS = 120        # a commit counts from two minutes before the first turn
+GIT_GRACE_SECONDS = 30 * 60   # ...and up to half an hour after the last one
+YIELD_MAX_PROJECTS = 8
+YIELD_OUTCOMES = ("landed", "reverted", "unmerged", "no-commit")
+YIELD_LABELS = {
+    "landed": "Landed on the mainline",
+    "reverted": "Reverted afterwards",
+    "unmerged": "Committed, never merged",
+    "no-commit": "No commit",
+}
+YIELD_SHORT = {"landed": "Landed", "reverted": "Reverted",
+               "unmerged": "Unmerged", "no-commit": "No commit"}
+
+
+def _git(root: str, *arguments: str, timeout: int = 10) -> str:
+    """One read-only git call. Any failure returns '': yield degrades, never raises."""
+    try:
+        proc = subprocess.run(
+            ("git", "-C", root, *arguments), capture_output=True, text=True,
+            timeout=timeout, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout if proc.returncode == 0 else ""
+
+
+_TOPLEVEL_CACHE: dict[str, str] = {}
+
+
+def git_toplevel(path: str) -> str:
+    """The repo a project key points at, or '' when it points at no repo at all."""
+    if path in _TOPLEVEL_CACHE:
+        return _TOPLEVEL_CACHE[path]
+    resolved = ""
+    if path and os.path.isdir(path):
+        resolved = _git(path, "rev-parse", "--show-toplevel").strip()
+    _TOPLEVEL_CACHE[path] = resolved
+    return resolved
+
+
+def mainline_ref(root: str) -> str:
+    """The ref a commit has to reach before it counts as landed."""
+    head = _git(root, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD").strip()
+    if head:
+        return head
+    for ref in ("refs/remotes/origin/main", "refs/remotes/origin/master",
+                "refs/heads/main", "refs/heads/master"):
+        if _git(root, "rev-parse", "--verify", "--quiet", ref).strip():
+            return ref
+    return "HEAD"
+
+
+_REVERT_RE = re.compile(r"This reverts commit ([0-9a-f]{7,40})")
+
+
+def repo_history(root: str, since_iso: str) -> dict:
+    """Commits in the window, each flagged for the mainline and for later reverts."""
+    window = ["--since", since_iso] if since_iso else []
+    commits = []
+    for line in _git(root, "log", "--all", "--no-merges", *window,
+                     "--pretty=%H%x1f%ct%x1f%s").splitlines():
+        parts = line.split("\x1f")
+        if len(parts) != 3:
+            continue
+        try:
+            commits.append({"sha": parts[0], "ts": int(parts[1]), "subject": parts[2]})
+        except ValueError:
+            continue
+    ref = mainline_ref(root)
+    landed = set(_git(root, "rev-list", ref, *window).split())
+    # A revert can land long after the window, so this one query is not bounded by it.
+    reverted: dict[int, set] = defaultdict(set)
+    for match in _REVERT_RE.finditer(
+            _git(root, "log", "--all", "--grep", "This reverts commit", "-n", "300",
+                 "--pretty=%B%x1e")):
+        prefix = match.group(1)
+        reverted[len(prefix)].add(prefix)
+    for commit in commits:
+        commit["landed"] = commit["sha"] in landed
+        commit["reverted"] = any(commit["sha"][:size] in shas
+                                 for size, shas in reverted.items())
+    return {"ref": ref.rsplit("/", 1)[-1], "commits": commits}
+
+
+def yield_report(session_buckets, limit: int | None = YIELD_MAX_PROJECTS) -> dict:
+    """What each session left behind in git.
+
+    The outcome is read from the repository, not from the transcript: a commit
+    made while a session was running, plus a short grace period, is attributed to
+    it, and the outcome is whether that commit reached the mainline, was reverted
+    afterwards, or never merged. Sessions whose directory is not a git repository
+    are left out rather than counted as unproductive.
+
+    `no-commit` is a category, not a verdict: reading, debugging and planning
+    sessions legitimately end without one.
+    """
+    groups: dict[str, list] = defaultdict(list)
+    seen = set()
+    outside = 0
+    for (project, sid), bucket in sorted(session_buckets.items(),
+                                         key=lambda item: -item[1].cost):
+        if sid in seen or bucket.first is None:
+            continue
+        seen.add(sid)
+        root = git_toplevel(project)
+        if not root:
+            outside += 1
+            continue
+        groups[root].append({
+            "id": sid, "short": sid[:8], "root": root,
+            "project": os.path.basename(root) or root, "cost": bucket.cost,
+            "first": bucket.first, "last": bucket.last or bucket.first,
+            "commits": [],
+        })
+
+    ranked = sorted(groups.items(), key=lambda kv: -sum(s["cost"] for s in kv[1]))
+    skipped = 0
+    if limit is not None and len(ranked) > limit:
+        skipped = sum(len(items) for _root, items in ranked[limit:])
+        ranked = ranked[:limit]
+
+    repos, sessions, unmatched = [], [], 0
+    for root, items in ranked:
+        floor = min(session["first"] for session in items) - timedelta(days=1)
+        history = repo_history(root, floor.astimezone().isoformat(timespec="seconds"))
+        for commit in history["commits"]:
+            # A commit belongs to the last session that was still running when it
+            # was authored, so two overlapping sessions never bank the same work.
+            owner = None
+            for session in items:
+                start = session["first"].timestamp() - GIT_LEAD_SECONDS
+                end = session["last"].timestamp() + GIT_GRACE_SECONDS
+                if start <= commit["ts"] <= end and (
+                        owner is None or session["first"] > owner["first"]):
+                    owner = session
+            if owner is None:
+                unmatched += 1
+                continue
+            owner["commits"].append(commit)
+        tally = {name: {"sessions": 0, "cost": 0.0} for name in YIELD_OUTCOMES}
+        for session in items:
+            commits = session["commits"]
+            if not commits:
+                outcome = "no-commit"
+            elif any(c["landed"] and not c["reverted"] for c in commits):
+                outcome = "landed"
+            elif any(c["reverted"] for c in commits):
+                outcome = "reverted"
+            else:
+                outcome = "unmerged"
+            session["outcome"] = outcome
+            tally[outcome]["sessions"] += 1
+            tally[outcome]["cost"] += session["cost"]
+            sessions.append({
+                "id": session["id"], "short": session["short"],
+                "project": session["project"], "outcome": outcome,
+                "cost": round(session["cost"], 4),
+                "start": session["first"].isoformat(),
+                "commits": [{"sha": c["sha"][:8], "subject": _short(c["subject"], 60),
+                             "landed": c["landed"], "reverted": c["reverted"]}
+                            for c in commits],
+            })
+        landed_commits = sum(1 for session in items for c in session["commits"]
+                             if c["landed"] and not c["reverted"])
+        repos.append({
+            "name": os.path.basename(root) or root, "path": root,
+            "mainline": history["ref"],
+            "cost": round(sum(session["cost"] for session in items), 4),
+            "sessions": len(items), "commits": len(history["commits"]),
+            "landed_commits": landed_commits,
+            "outcomes": {name: {"sessions": value["sessions"],
+                                "cost": round(value["cost"], 4)}
+                         for name, value in tally.items()},
+        })
+
+    totals = {name: {"sessions": 0, "cost": 0.0} for name in YIELD_OUTCOMES}
+    for repo in repos:
+        for name, value in repo["outcomes"].items():
+            totals[name]["sessions"] += value["sessions"]
+            totals[name]["cost"] = round(totals[name]["cost"] + value["cost"], 4)
+    landed_commits = sum(repo["landed_commits"] for repo in repos)
+    sessions.sort(key=lambda session: -session["cost"])
+    return {
+        "repos": sorted(repos, key=lambda repo: -repo["cost"]),
+        "outcomes": totals,
+        "sessions": sessions,
+        "landed_commits": landed_commits,
+        "cost_per_landed": round(totals["landed"]["cost"] / landed_commits, 4)
+                           if landed_commits else None,
+        "unmatched_commits": unmatched,
+        "outside_git": outside,
+        "skipped_sessions": skipped,
+    }
+
+
 def _money(value: float) -> str:
     return f"{value:,.2f}"
+
+
+def _count(n: int, word: str) -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
 def _tokens(n: float) -> str:
@@ -1186,6 +1634,69 @@ MONTHS_SHORT = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 MONTHS_LONG = ("January", "February", "March", "April", "May", "June", "July",
                "August", "September", "October", "November", "December")
+
+
+AUDIT_MAX_SESSIONS = 300
+
+
+def audit_sessions(session_buckets, table, memo,
+                   limit: int = AUDIT_MAX_SESSIONS) -> dict:
+    """Grades the sessions of the window, one by one.
+
+    There is no machine-wide grade here on purpose: what a setup costs is only
+    visible in the sessions that ran under it, so every figure below belongs to
+    a session. The costliest ones are read first, capped by `limit`, and the
+    report says how many that was.
+    """
+    ranked, seen = [], set()
+    for (project, sid), bucket in sorted(session_buckets.items(),
+                                         key=lambda item: -item[1].cost):
+        if sid in seen:
+            continue
+        seen.add(sid)
+        ranked.append((project, sid))
+
+    rows: list = []
+    kinds: dict = defaultdict(float)
+    cost_seen = 0.0
+    for project, sid in ranked[:limit]:
+        path = find_transcript(sid)
+        if path is None:
+            continue
+        detail = session_payload(path, table, memo, top=0)
+        if detail is None:
+            continue
+        cost_seen += detail["cost"]
+        weighted = [finding for finding in detail["triage"] if finding["weight"] > 0]
+        for finding in weighted:
+            if finding["kind"] in GRADE_WEIGHTS:
+                kinds[finding["kind"]] += finding["cost"]
+        lead = max(weighted, key=lambda finding: finding["weight"], default=None)
+        rows.append({
+            "id": detail["id"], "short": detail["short"],
+            "project": os.path.basename(project.rstrip("/")) or detail["project"],
+            "cost": detail["cost"], "score": detail["score"],
+            "grade": detail["grade"],
+            "lead": None if lead is None else {"kind": lead["kind"],
+                                               "cost": lead["cost"],
+                                               "share": lead["share"]},
+        })
+    # The median, not the mean: one runaway session should not repaint a window
+    # in which everything else was clean.
+    scores = sorted(row["score"] for row in rows)
+    middle = scores[len(scores) // 2] if scores else 0.0
+    return {
+        "rows": rows,
+        "parsed": len(rows),
+        "pool": len(ranked),
+        "cost_seen": round(cost_seen, 4),
+        "score": round(middle, 1),
+        "grade": grade_for(middle),
+        "spread": {letter: sum(1 for row in rows if row["grade"] == letter)
+                   for letter in "ABCDF"},
+        "kinds": {kind: round(cost, 4)
+                  for kind, cost in sorted(kinds.items(), key=lambda kv: -kv[1])},
+    }
 
 
 def _clock(iso: str | None) -> str:
@@ -1342,6 +1853,35 @@ def _chip(exact: bool, focusable: bool = True) -> str:
             f'data-tip="{html_escape(tip)}">{label}</span>')
 
 
+GRADE_TIP = ("Grade {grade}, score {score:.0f} — what this session could have "
+             "avoided, as a share of what it cost: junk or duplicate reads, a rebuilt "
+             "cache, a compaction, replies replayed to the end. Being long or "
+             "expensive is not a fault.")
+
+
+def _grade_chip(session: dict, focusable: bool = True) -> str:
+    """The A-to-F letter, which grades one session and nothing wider."""
+    grade = session.get("grade")
+    if not grade:
+        return ""
+    focus = ' tabindex="0"' if focusable else ""
+    tip = GRADE_TIP.format(grade=grade, score=session.get("score") or 0)
+    return (f'<span class="chip grade g{grade.lower()} src"{focus} '
+            f'data-tip="{html_escape(tip)}">{grade}</span>')
+
+
+def _help(text: str) -> str:
+    """A section's explanation, folded into one mark beside its title.
+
+    On a session page the headings carry most of the navigation, and a
+    paragraph under each of them pushes the figures down the screen. The prose
+    is worth keeping, so it moves one hover away rather than disappearing.
+    """
+    tip = html_escape(text)
+    return (f'<span class="help src" tabindex="0" aria-label="{tip}" '
+            f'data-tip="{tip}">?</span>')
+
+
 def _th(label: str, numeric: bool = False) -> str:
     """A column header that explains itself on hover, reusing the .src tooltip."""
     tip = COLUMN_TIPS.get(label)
@@ -1423,8 +1963,14 @@ def render_context_chart(session: dict) -> str:
     curve = session.get("curve") or []
     if len(curve) < 2:
         return ""
-    W, H, PAD_L, PAD_R, PAD_T, PAD_B = 1000, 284, 58, 16, 64, 30
+    # The bottom padding holds two rows below the plot: the turn axis, then the
+    # strip the hover readout is written into. Keeping the readout out of the
+    # plot is the point of it — a line of text laid over the curve competes with
+    # it, and on a dense session it lands on the very peak being read.
+    W, H, PAD_L, PAD_R, PAD_T, PAD_B = 1000, 322, 58, 16, 64, 68
     inner_w, inner_h = W - PAD_L - PAD_R, H - PAD_T - PAD_B
+    axis_y = PAD_T + inner_h + 19
+    strip_y, strip_h = PAD_T + inner_h + 30, 26
     peak = max(point["ctx"] for point in curve) or 1
     span = max(1, len(curve) - 1)
     uid = esc(session["short"])
@@ -1452,6 +1998,11 @@ def render_context_chart(session: dict) -> str:
     svg.append(f'<path d="{path} L{px(span):.1f},{PAD_T + inner_h:.1f} '
                f'L{PAD_L},{PAD_T + inner_h:.1f} Z" fill="url(#ctxFade-{uid})"/>')
     svg.append(f'<path class="spark" d="{path}"/>')
+    svg.append(f'<rect class="readout-strip" x="{PAD_L}" y="{strip_y}" '
+               f'width="{inner_w}" height="{strip_h}" rx="7"/>')
+    svg.append(f'<text class="readout-idle" x="{PAD_L + 12}" '
+               f'y="{strip_y + 17.5:.1f}">hover the curve for the turn behind any '
+               "point</text>")
 
     # Every re-baselining, named: a compaction is not a rewind.
     for i, point in enumerate(curve):
@@ -1500,20 +2051,23 @@ def render_context_chart(session: dict) -> str:
         readout = (f'turn {point["turn"]} \u00b7 {esc(point["label"])} \u00b7 '
                    f'+{_tokens(point["added"])} \u00b7 ${_money(point["cost"])} '
                    f'\u00b7 ctx {_tokens(point["ctx"])}')
+        # The band reaches down over the strip, so moving onto the line of text
+        # does not dismiss it halfway through.
         svg.append(f'<rect class="hit" x="{x - band / 2:.1f}" y="{PAD_T}" '
-                   f'width="{band:.2f}" height="{inner_h:.1f}"/>')
-        # The line of text sits at a fixed spot rather than following the cursor:
-        # it can never run off the edge, and it does not jitter while reading it.
+                   f'width="{band:.2f}" '
+                   f'height="{strip_y + strip_h - PAD_T:.1f}"/>')
+        # The text sits at a fixed spot rather than following the cursor: it can
+        # never run off the edge, and it does not jitter while being read.
         svg.append(
             f'<g class="readout">'
             f'<line class="guide" x1="{x:.1f}" y1="{PAD_T}" '
             f'x2="{x:.1f}" y2="{PAD_T + inner_h:.1f}"/>'
             f'<circle class="guide-dot" cx="{x:.1f}" cy="{y:.1f}" r="4"/>'
-            f'<text class="readout-tag" x="{PAD_L + 4}" y="{PAD_T + 15}">'
-            f'{readout}</text></g>')
+            f'<text class="readout-tag" x="{PAD_L + 12}" '
+            f'y="{strip_y + 17.5:.1f}">{readout}</text></g>')
     for i in (0, span // 2, span):
         anchor = "start" if i == 0 else "end" if i == span else "middle"
-        svg.append(f'<text class="axis" x="{px(i):.1f}" y="{H - 8}" '
+        svg.append(f'<text class="axis" x="{px(i):.1f}" y="{axis_y}" '
                    f'text-anchor="{anchor}">turn {curve[i]["turn"]}</text>')
     svg.append("</svg>")
 
@@ -1526,27 +2080,69 @@ def render_context_chart(session: dict) -> str:
 
 
 def render_session_triage(session: dict) -> list:
-    """Renders the same investigation leads in the session that produced them."""
-    findings = session.get("triage") or []
-    if not findings:
+    """The session's grade, and the leads it is made of."""
+    esc = html_escape
+    findings = sorted(session.get("triage") or [],
+                      key=lambda finding: (-finding["weight"], -finding["cost"]))
+    grade = session.get("grade")
+    if not grade and not findings:
         return []
-    out = ["<section class=\"triage\"><div class=\"section-head\">",
-           "<h2>What to inspect in this session</h2>",
-           "<p class=\"note\">The cost attached to each lead is the part of this "
-           "session it explains. Leads appear only from 10% of the session and $0.25; "
-           "use the tables below to trace the precise turn.</p>",
-           "</div>"]
+    avoidable = sum(finding["cost"] for finding in findings
+                    if finding["weight"] and finding["kind"] in GRADE_WEIGHTS)
+    hint = _help("The letter grades this session and nothing wider: what the run "
+                 "could have avoided, as a share of what it cost. Being long or "
+                 "expensive is not a fault \u2014 a heavy subagent or tool result is a "
+                 "lead worth opening, and weighs nothing on the grade. Leads appear "
+                 "from 10% of the session and $0.25; junk reads, duplicate reads and "
+                 "oversized instructions from $0.25 alone.")
+    out = ['<section class="triage">',
+           f"<h2>What this session could have avoided{hint}</h2>"]
+    stats = [
+        ("Grade", grade or "\u2014", f"g{(grade or '').lower()}",
+         "A to F, from what this session could have avoided as a share of what it "
+         "cost \u2014 never from its size. The bands are A under 3, B under 8, C "
+         "under 15, D under 24, F beyond."),
+        ("Score", f'{session.get("score") or 0:.0f}', "",
+         "The weighted sum of the leads below. Each one weighs its own share of the "
+         "session, capped per kind, and fades in under a couple of dollars: a bad "
+         "rate on small change is a rate, not something to act on."),
+        ("Avoidable", "$" + _money(avoidable), "",
+         "What the leads that weigh cost together: junk or duplicate reads, a cache "
+         "rebuilt after an idle gap, a compaction carried to the end, replies "
+         "replayed past a fifth of the bill. Leads that score nothing are left out."),
+        ("Leads", str(len(findings)), "",
+         "How many patterns were found here, weighing or not. Subagents and a heavy "
+         "tool result are listed but score zero: worth opening, not faults."),
+    ]
+    out.append('<div class="headline tipped">')
+    for label, value, tone, tip in stats:
+        cls = "stat lead" if tone else "stat"
+        mark = f' class="{tone}"' if tone else ""
+        out.append(f'<div class="{cls}"><span class="eyebrow src" tabindex="0" '
+                   f'data-tip="{esc(tip)}">{esc(label)}</span>'
+                   f"<b{mark}>{esc(str(value))}</b></div>")
+    out.append("</div>")
+    if not findings:
+        out.append('<p class="note">Nothing stood out: no junk read, no file read '
+                   "twice, no cache rebuilt after a pause.</p></section>")
+        return out
     out.append('<div class="triage-list">')
-    for rank, finding in enumerate(sorted(findings, key=lambda item: -item["cost"]), 1):
+    for rank, finding in enumerate(findings, 1):
+        penalty = (f'{finding["weight"]:.0f} of the score' if finding["weight"]
+                   else "no penalty")
+        items = "".join(f"<li>{esc(item)}</li>" for item in finding.get("items") or [])
         out.append(
             '<article class="triage-item">'
             f'<span class="triage-rank">{rank:02d}</span>'
             '<div class="triage-main">'
-            f'<div class="triage-title"><b>${_money(finding["cost"])}</b></div>'
-            f'<p>{html_escape(finding["reason"])}</p>'
-            f'<p class="triage-advice">{html_escape(finding["advice"])}</p>'
+            f'<div class="triage-title"><b>${_money(finding["cost"])}</b>'
+            f'<span class="triage-share">{finding["share"]:.0f}% of the session '
+            f'\u00b7 {esc(penalty)}</span></div>'
+            f'<p>{esc(finding["reason"])}</p>'
+            + (f'<ul class="triage-items">{items}</ul>' if items else "")
+            + f'<p class="triage-advice">{esc(finding["advice"])}</p>'
             '<ul class="triage-tips">'
-            + "".join(f'<li>{html_escape(tip)}</li>' for tip in finding["tips"])
+            + "".join(f"<li>{esc(tip)}</li>" for tip in finding["tips"])
             + "</ul>"
             "</div></article>")
     out.append("</div>")
@@ -1576,7 +2172,7 @@ def render_session_detail(session: dict, payload: dict, standalone: bool) -> lis
         out.append(f'<h1>{esc(session["project"])}</h1>')
         out.append(f'<div class="identity"><span class="hero-cost"><span>$</span>'
                    f'{_money(session["cost"])}</span>'
-                   f'{_chip(session["exact"])}</div>')
+                   f'{_chip(session["exact"])}{_grade_chip(session)}</div>')
         run = [f'<span>{esc(_span(session["start"], session["end"]))}</span>']
         elapsed = _elapsed(session["start"], session["end"])
         if elapsed:
@@ -1630,29 +2226,23 @@ def render_session_detail(session: dict, payload: dict, standalone: bool) -> lis
     chart = render_context_chart(session)
     if chart:
         out.append("<section>")
-        out.append("<h2>How the context grew</h2>")
-        if standalone:
-            out.append('<p class="note">The context carried into each turn, in order. '
-                       "Every turn pays for the whole height of the curve under it, "
-                       "which is why a step early on costs more than the same step "
-                       "late. Hover any point for the command behind it.</p>")
+        hint = _help("The context carried into each turn, in order. Every turn "
+                     "pays for the whole height of the curve under it, which is why "
+                     "a step early on costs more than the same step late. Hover any "
+                     "point for the command behind it.") if standalone else ""
+        out.append(f"<h2>How the context grew{hint}</h2>")
         out.append(chart)
         out.append("</section>")
 
     sources = [src for src in session["sources"] if src["cost"] > 0]
     total_sources = sum(src["cost"] for src in sources) or 1
     out.append("<section>")
-    if standalone:
-        out.append('<div class="section-head">')
-        out.append("<h2>What filled the context</h2>")
-        out.append('<p class="note">Every turn resends the whole accumulated context, '
-                   "so a source costs its own size multiplied by the number of later "
-                   "turns that carry it \u2014 an attribution, where the session total "
-                   "above is measured. Hover any source or column header for what it "
-                   "means.</p>")
-        out.append("</div>")
-    else:
-        out.append("<h2>What filled the context</h2>")
+    hint = _help("Every turn resends the whole accumulated context, so a source "
+                 "costs its own size multiplied by the number of later turns that "
+                 "carry it \u2014 an attribution, where the session total above is "
+                 "measured. Hover any source or column header for what it means."
+                 ) if standalone else ""
+    out.append(f"<h2>What filled the context{hint}</h2>")
     out.append('<div class="stack">')
     for i, src in enumerate(sources):
         share = (src["cost"] / total_sources) * 100
@@ -1710,12 +2300,10 @@ def render_session_detail(session: dict, payload: dict, standalone: bool) -> lis
 
     if session.get("agents"):
         out.append("<section>")
-        out.append("<h2>Subagents</h2>")
-        if standalone:
-            out.append('<p class="note">Each runs its own context, off the main '
-                       "chain. What the main session paid is only the report handed "
-                       "back \u2014 the <code>Agent</code> line above; what the run "
-                       "itself cost is here.</p>")
+        hint = _help("Each runs its own context, off the main chain. What the main "
+                     "session paid is only the report handed back \u2014 the Agent "
+                     "line above; what the run itself cost is here.") if standalone else ""
+        out.append(f"<h2>Subagents{hint}</h2>")
         out.append('<div class="scroll"><table><thead><tr><th>Agent</th>'
                    + _th("Type") + _th("Turns", numeric=True)
                    + _th("Output", numeric=True) + _th("Cost", numeric=True)
@@ -1744,6 +2332,185 @@ def render_session_detail(session: dict, payload: dict, standalone: bool) -> lis
                             for k in session["skills"])
         out.append(f'<p class="note">Turns attributed to a skill: {listing}.</p>')
     return out
+
+
+def render_yield(payload: dict) -> list:
+    """The git outcome of the window: what landed, what came back, what never shipped."""
+    data = payload.get("yield") or {}
+    esc = html_escape
+    out = ['<section><h2>What it left in git</h2>']
+    repos = data.get("repos") or []
+    if not repos:
+        out.append('<p class="note">No session in this window ran inside a git '
+                   "repository, so there is nothing to correlate.</p></section>")
+        return out
+
+    served = bool(payload.get("served"))
+    state = _state(payload)
+    outcomes = data["outcomes"]
+    total = sum(value["cost"] for value in outcomes.values()) or 1
+    count = len(YIELD_OUTCOMES)
+
+    out.append('<div class="stack">')
+    for i, name in enumerate(YIELD_OUTCOMES):
+        share = outcomes[name]["cost"] / total * 100
+        if share <= 0:
+            continue
+        out.append(f'<span style="width:{share:.2f}%;background:{_shade(i, count)}" '
+                   f'title="{esc(YIELD_LABELS[name])} — '
+                   f'${_money(outcomes[name]["cost"])}"></span>')
+    out.append("</div>")
+    out.append('<div class="legend">')
+    for i, name in enumerate(YIELD_OUTCOMES):
+        value = outcomes[name]
+        out.append(f'<span><span class="swatch" style="background:{_shade(i, count)}">'
+                   f'</span>{esc(YIELD_LABELS[name])} · ${_money(value["cost"])} '
+                   f'· {100 * value["cost"] / total:.0f}%</span>')
+    out.append("</div>")
+
+    correlated = sum(value["sessions"] for value in outcomes.values())
+    facts = [("Sessions correlated", str(correlated)),
+             ("Commits landed", str(data["landed_commits"])),
+             ("Cost per landed commit",
+              f'${_money(data["cost_per_landed"])}' if data["cost_per_landed"]
+              else "—"),
+             ("Nothing on the mainline",
+              f'${_money(total - outcomes["landed"]["cost"])}')]
+    out.append('<div class="facts">')
+    for label, value in facts:
+        tip = FACT_TIPS.get(label)
+        eyebrow = (f'<span class="eyebrow src" tabindex="0" data-tip="{esc(tip)}">'
+                   f"{esc(label)}</span>" if tip
+                   else f'<span class="eyebrow">{esc(label)}</span>')
+        out.append(f'<div class="fact">{eyebrow}<b>{esc(value)}</b></div>')
+    out.append("</div>")
+
+    out.append('<div class="scroll"><table><thead><tr>'
+               + _th("Repo") + _th("Mainline") + _th("Sess.", numeric=True)
+               + "".join(_th(YIELD_SHORT[name], numeric=True)
+                         for name in YIELD_OUTCOMES)
+               + _th("Cost", numeric=True) + "</tr></thead><tbody>")
+    for repo in repos:
+        cells = "".join(f'<td class="n">{repo["outcomes"][name]["sessions"]}</td>'
+                        for name in YIELD_OUTCOMES)
+        out.append(f'<tr><td>{esc(repo["name"])}</td>'
+                   f'<td><span class="branch">{esc(repo["mainline"])}</span></td>'
+                   f'<td class="n">{repo["sessions"]}</td>{cells}'
+                   f'<td class="n">${_money(repo["cost"])}</td></tr>')
+    out.append("</tbody></table></div>")
+
+    unshipped = [s for s in data["sessions"] if s["outcome"] != "landed"][:6]
+    if unshipped:
+        out.append('<span class="eyebrow">Costliest sessions with nothing on '
+                   "the mainline</span>")
+        out.append('<div class="rows">')
+        peak = max(s["cost"] for s in unshipped) or 1
+        for rank, session in enumerate(unshipped, 1):
+            share = max(1.5, (session["cost"] / peak) * 100)
+            meta = f'{_clock(session["start"])} · {YIELD_LABELS[session["outcome"]]}'
+            if session["commits"]:
+                meta += " · " + _count(len(session["commits"]), "commit")
+            body = (f'<span class="row-fill"></span>'
+                    f'<span class="rank">{rank:02d}</span>'
+                    f'<span class="row-main"><span class="row-title">'
+                    f'<span class="proj">{esc(session["project"])}</span>'
+                    f'<span class="id">{esc(session["short"])}</span></span>'
+                    f'<span class="row-meta">{esc(meta)}</span></span>'
+                    f'<span class="row-cost">${_money(session["cost"])}</span>')
+            if served:
+                target = "/session" + _query(state, id=session["id"])
+                out.append(f'<a class="row" style="--share:{share:.1f}%" '
+                           f'href="{esc(target)}">{body}</a>')
+            else:
+                out.append(f'<div class="row" style="--share:{share:.1f}%">{body}</div>')
+        out.append("</div>")
+
+    notes = []
+    if data["unmatched_commits"]:
+        notes.append(_count(data["unmatched_commits"], "commit")
+                     + " were authored outside every session")
+    if data["outside_git"]:
+        notes.append(_count(data["outside_git"], "session")
+                     + " ran outside a git repo")
+    if data["skipped_sessions"]:
+        notes.append(_count(data["skipped_sessions"], "session")
+                     + " in smaller repos were left out")
+    tail = (" " + "; ".join(notes) + ".") if notes else ""
+    out.append('<p class="note">Outcomes come from git, correlated on time: a commit '
+               "authored while a session ran — from two minutes before its first "
+               "turn to half an hour after its last — is attributed to it, then "
+               "checked against the mainline. A session without a commit is not waste "
+               "on its own: reading, debugging and planning end that way. What matters "
+               f"is how much of the bill sits there, week after week.{esc(tail)}</p>")
+    out.append("</section>")
+    return out
+
+
+GRADE_KINDS = {
+    "junk-reads": "junk reads",
+    "duplicate-reads": "duplicate reads",
+    "cache": "cache rebuilds",
+    "compaction": "compaction",
+    "replayed-output": "replayed output",
+    "instructions": "instructions",
+}
+GRADE_NOTE = ("The grade counts what a session could have avoided, as a share of what "
+              "it cost.\n  Size is not a fault: a long session that wasted nothing "
+              "still scores A.")
+
+
+def _lead_text(row: dict) -> str:
+    lead = row.get("lead")
+    if not lead:
+        return "\u2014"
+    return (f"{GRADE_KINDS.get(lead['kind'], lead['kind'])} "
+            f"{lead['share']:.0f}% (${_money(lead['cost'])})")
+
+
+def print_audit(data: dict, since: datetime | None, top: int = 15):
+    period = f" since {since.date()}" if since else ""
+    print(f"\nSession grades{period} \u2014 {data['parsed']} of "
+          f"{_count(data['pool'], 'session')} read")
+    if not data["rows"]:
+        print("No session to grade in this window.")
+        return
+    spread = " \u00b7 ".join(f"{letter} {count}"
+                             for letter, count in data["spread"].items() if count)
+    print(f"  Median grade {data['grade']} (score {data['score']:.1f})   {spread}\n")
+    worst = sorted(data["rows"], key=lambda row: (-row["score"], -row["cost"]))
+    hidden = max(0, len(worst) - top)
+    rows = [[row["grade"], row["short"], _short(row["project"], 22),
+             f"{row['cost']:,.2f}", f"{row['score']:.0f}", _lead_text(row)]
+            for row in worst[:top]]
+    if hidden:
+        rows.append([f"({hidden} more)", "", "", "", "", ""])
+    render_table(["Grade", "Session", "Project", "Cost $", "Score",
+                  "What weighs most"], rows, ["l", "l", "l", "r", "r", "l"])
+    if data["kinds"]:
+        parts = ", ".join(f"{GRADE_KINDS.get(kind, kind)} ${_money(cost)}"
+                          for kind, cost in data["kinds"].items())
+        print(f"\nAvoidable across those sessions: {parts}.")
+    print(f"  {GRADE_NOTE}")
+
+
+def print_session_grade(detail: dict):
+    findings = sorted(detail.get("triage") or [],
+                      key=lambda finding: (-finding["weight"], -finding["cost"]))
+    print(f"\nGrade {detail['grade']} (score {detail['score']:.0f}) \u2014 what this "
+          "session could have avoided\n")
+    if not findings:
+        print("  Nothing stood out.")
+        return
+    for rank, finding in enumerate(findings, 1):
+        penalty = (f"{finding['weight']:.0f} of the score" if finding["weight"]
+                   else "no penalty")
+        print(f"{rank}. ${_money(finding['cost'])} \u00b7 {finding['share']:.0f}% "
+              f"\u00b7 {penalty}")
+        print(f"   {finding['reason']}")
+        for item in finding["items"]:
+            print(f"     \u00b7 {item}")
+        print(f"   \u2192 {finding['advice']}")
+    print(f"\n  {GRADE_NOTE}")
 
 
 def render_footer(payload: dict) -> list:
@@ -1937,7 +2704,8 @@ def render_body(payload: dict) -> str:
                 f'<span class="row-main"><span class="row-title">'
                 f'<span class="proj">{esc(session["project"])}</span>'
                 f'<span class="id">{esc(session["short"])}</span>'
-                f'{_chip(session["exact"], focusable=False)}</span>'
+                f'{_chip(session["exact"], focusable=False)}'
+                f'{_grade_chip(session, focusable=False)}</span>'
                 f'<span class="row-meta">{esc(meta)}</span></span>'
                 f'<span class="row-cost">${_money(session["cost"])}</span></a>')
         out.append("</div>")
@@ -1958,6 +2726,9 @@ def render_body(payload: dict) -> str:
             f'<div class="bar-value">${_money(project["cost_usd"])}'
             f'<small>{project["sessions"]} session{plural}</small></div></div>')
     out.append("</div></section>")
+
+    if payload.get("yield"):
+        out += render_yield(payload)
 
     if not served:
         for session in payload["sessions"]:
@@ -2173,6 +2944,9 @@ def analyze_session(needle: str, table, memo, top: int):
         render_table(["Skill", "Cost $"],
                      [[k, f"{v:,.2f}"] for k, v in sorted(skills.items(), key=lambda kv: -kv[1])],
                      ["l", "r"])
+    graded = session_payload(path, table, memo, top=0)
+    if graded:
+        print_session_grade(graded)
     print("\nCost = public API list price. Attribution spreads the measured context "
           "growth;\nparallel calls share their delta in proportion to result size.")
 
@@ -2188,6 +2962,59 @@ def print_triage(data: dict, since: datetime | None):
         print(f"{rank}. ${finding['cost']:,.2f} — {finding['project']} {finding['short']}")
         print(f"   {finding['reason']}")
         print(f"   → {finding['advice']}")
+
+
+def print_yield(data: dict, since: datetime | None, top: int = 8):
+    period = f" since {since.date()}" if since else ""
+    repos = data["repos"]
+    if not repos:
+        print(f"\nYield{period}\n")
+        print("No session in this window ran inside a git repository.")
+        return
+    counted = sum(value["sessions"] for value in data["outcomes"].values())
+    print(f"\nWhat the sessions left in git{period} — {_count(len(repos), 'repo')}, "
+          f"{_count(counted, 'session')}\n")
+    total_cost = sum(value["cost"] for value in data["outcomes"].values()) or 1
+    rows = [[YIELD_LABELS[name],
+             str(data["outcomes"][name]["sessions"]),
+             f"{data['outcomes'][name]['cost']:,.2f}",
+             f"{100 * data['outcomes'][name]['cost'] / total_cost:.0f}%"]
+            for name in YIELD_OUTCOMES]
+    rows.append(["TOTAL", str(counted), f"{total_cost:,.2f}", ""])
+    render_table(["Outcome", "Sess.", "Cost $", "Share"], rows, ["l", "r", "r", "r"])
+
+    if data["cost_per_landed"] is not None:
+        print(f"\n${data['cost_per_landed']:,.2f} per commit that landed, across "
+              f"{_count(data['landed_commits'], 'commit')}.")
+    notes = []
+    if data["unmatched_commits"]:
+        notes.append(f"{_count(data['unmatched_commits'], 'commit')} fell outside "
+                     "every session")
+    if data["outside_git"]:
+        notes.append(f"{_count(data['outside_git'], 'session')} ran outside a git repo")
+    if data["skipped_sessions"]:
+        notes.append(f"{_count(data['skipped_sessions'], 'session')} in smaller "
+                     "repos left out")
+    if notes:
+        print("  " + "; ".join(notes) + ".")
+
+    unshipped = [s for s in data["sessions"] if s["outcome"] != "landed"][:top]
+    if unshipped:
+        print("\nCostliest sessions with nothing on the mainline\n")
+        render_table(
+            ["Project", "Session", "Start", "Outcome", "Cost $"],
+            [[s["project"], s["short"], _clock(s["start"]),
+              YIELD_LABELS[s["outcome"]], f"{s['cost']:,.2f}"] for s in unshipped],
+            ["l", "l", "l", "l", "r"],
+        )
+        print("\n  A session without a commit is not waste on its own: reading,"
+              "\n  debugging and planning end that way. The number to watch is how"
+              "\n  much of the bill sits there week after week.")
+
+    print("\n  Outcomes come from git, correlated on time: commits authored while a"
+          "\n  session ran (2 min before its first turn to 30 min after its last)"
+          f"\n  and checked against the mainline. Repos: "
+          + ", ".join(f"{repo['name']} ({repo['mainline']})" for repo in repos) + ".")
 
 
 def statusline(table, memo) -> str:
@@ -2349,6 +3176,23 @@ def main():
                         help="cap on the sessions --tools parses (default: 500)")
     parser.add_argument("--triage", action="store_true",
                         help="show the few costly patterns worth inspecting")
+    parser.add_argument("--audit", action="store_true",
+                        help="grade each session A to F on what it could have avoided "
+                             "(the dashboard always shows the letter)")
+    parser.add_argument("--audit-max", type=int, default=AUDIT_MAX_SESSIONS,
+                        metavar="N",
+                        help=f"cap on the sessions --audit parses "
+                             f"(default: {AUDIT_MAX_SESSIONS})")
+    parser.add_argument("--yield", dest="git_yield", action="store_true",
+                        help="what each session left in git: landed, reverted, "
+                             "never merged, or no commit at all")
+    parser.add_argument("--yield-max", type=int, default=YIELD_MAX_PROJECTS,
+                        metavar="N",
+                        help=f"cap on the repos --yield queries "
+                             f"(default: {YIELD_MAX_PROJECTS})")
+    parser.add_argument("--no-git", action="store_true",
+                        help="never shell out to git; the dashboard drops its yield "
+                             "section")
     parser.add_argument("--project", help="substring filter on the project key")
     parser.add_argument("--session", metavar="ID",
                         help="break down a single session (id prefix or path)")
@@ -2386,11 +3230,14 @@ def main():
         args.sessions_max = max(1, min(60, args.sessions_max))
         passthrough = []
         for flag, value in (("--by", args.by), ("--project", args.project),
-                            ("--since", args.since)):
+                            ("--since", args.since),
+                            ("--yield-max", args.yield_max
+                             if args.yield_max != YIELD_MAX_PROJECTS else None)):
             if value and not (flag == "--by" and value == "repo"):
                 passthrough += [flag, str(value)]
         for flag, on in (("--split-worktrees", args.split_worktrees),
                          ("--no-cost-state", args.no_cost_state),
+                         ("--no-git", args.no_git),
                          ("--no-fetch", args.no_fetch)):
             if on:
                 passthrough.append(flag)
@@ -2561,6 +3408,22 @@ def main():
         print_triage(triage_data, since)
         return
 
+    if args.audit and not args.dashboard:
+        data = audit_sessions(sessions, table, memo, limit=max(1, args.audit_max))
+        if args.json:
+            print(json.dumps(data, indent=2))
+        else:
+            print_audit(data, since, top=args.top or 15)
+        return
+
+    if args.git_yield:
+        data = yield_report(sessions, limit=max(1, args.yield_max))
+        if args.json:
+            print(json.dumps(data, indent=2))
+        else:
+            print_yield(data, since)
+        return
+
     def serialize(bucket: Bucket):
         return {
             "sessions": len(bucket.sessions),
@@ -2624,6 +3487,8 @@ def main():
             "served": args.served,
             "window": window_meta(since, args.days),
             "coverage": {"measured": len(seen_sessions), "total": len(total.sessions)},
+            "yield": None if args.no_git else yield_report(
+                sessions, limit=max(1, args.yield_max)),
             "totals": serialize(total),
             "projects": [dict(serialize(b), name=os.path.basename(k.rstrip("/")) or k, path=k)
                          for k, b in ordered],
