@@ -225,6 +225,26 @@
     overflow: hidden;
     box-shadow: var(--shadow-sm);
   }
+  /* A headline whose labels explain themselves cannot clip its own children:
+     the corners are rounded on the end cells instead, as the facts row does. */
+  .headline.tipped { overflow: visible; }
+  .headline.tipped .stat:first-child {
+    border-radius: var(--r) 0 0 var(--r);
+  }
+  .headline.tipped .stat:last-child {
+    border-radius: 0 var(--r) var(--r) 0;
+  }
+  /* The label is set in small caps; its explanation is prose and must not be.
+     It opens upwards, so the figure under the label stays readable. */
+  .headline.tipped .src::after {
+    text-transform: none;
+    letter-spacing: 0;
+    font-weight: 400;
+    color: var(--ink);
+    z-index: 6;
+  }
+  /* The last cells would push their explanation past the right edge. */
+  .headline.tipped .stat:nth-last-child(-n+2) .src::after { left: auto; right: -12px; }
   .stat {
     background: var(--surface);
     padding: 16px 18px;
@@ -347,6 +367,20 @@
     fill: var(--brass);
   }
   .peak-dot { fill: var(--accent-deep); stroke: var(--surface); stroke-width: 2; }
+  /* The readout has a row of its own below the plot: a line of text laid over
+     the curve competes with the very shape it describes. */
+  .readout-strip { fill: var(--sunk); stroke: var(--hair); }
+  .readout-idle {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: .04em;
+    fill: var(--faint);
+    transition: opacity .12s;
+  }
+  .chart svg:hover .readout-idle { opacity: 0; }
+  /* Inside the strip the text needs no halo: it has a flat background of its
+     own. Only the curve chart has a strip, so the daily one keeps its stroke. */
+  .readout-strip ~ .readout .readout-tag { font-size: 11px; stroke: none; }
   /* The hover readout: revealed by the band in front of it, no script involved. */
   .readout { opacity: 0; pointer-events: none; transition: opacity .1s; }
   .hit:hover + .readout { opacity: 1; }
@@ -514,6 +548,23 @@
     font-size: 12.5px;
   }
   .triage-tips li { margin: 3px 0; }
+  /* Share and penalty sit beside the amount, and must not compete with it. */
+  .triage-title .triage-share {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 400;
+    letter-spacing: .01em;
+    color: var(--faint);
+  }
+  /* The evidence behind a lead: paths and counts, so monospace. */
+  .triage-items {
+    margin: 8px 0 0;
+    padding-left: 18px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11.5px;
+  }
+  .triage-items li { margin: 2px 0; overflow-wrap: anywhere; }
 
   /* --- session list (index) --------------------------------------------- */
   .rows { display: flex; flex-direction: column; gap: 7px; }
@@ -639,6 +690,37 @@
     color: var(--brass);
     border-color: color-mix(in srgb, var(--brass) 38%, transparent);
     background: color-mix(in srgb, var(--brass) 9%, transparent);
+  }
+
+  /* A grade is one letter. It drops the status dot and centres itself, so that
+     down a list of sessions it reads as a mark rather than as another state. */
+  .chip.grade {
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: .06em;
+    padding: 3px 8px;
+    min-width: 22px;
+    justify-content: center;
+  }
+  .chip.grade::before { display: none; }
+  .ga, .gb { color: var(--ok); }
+  .gc { color: var(--brass); }
+  .gd, .gf { color: var(--accent); }
+  .chip.ga, .chip.gb {
+    border-color: color-mix(in srgb, var(--ok) 38%, transparent);
+    background: color-mix(in srgb, var(--ok) 9%, transparent);
+  }
+  .chip.gc {
+    border-color: color-mix(in srgb, var(--brass) 38%, transparent);
+    background: color-mix(in srgb, var(--brass) 9%, transparent);
+  }
+  .chip.gd {
+    border-color: color-mix(in srgb, var(--accent) 38%, transparent);
+    background: color-mix(in srgb, var(--accent) 9%, transparent);
+  }
+  .chip.gf {
+    border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
   }
 
   /* A chip can carry the .src tooltip too. It keeps its pill shape, loses the
@@ -915,6 +997,39 @@
     visibility: visible;
     transform: none;
   }
+  /* A section's explanation, folded into a mark beside its title. It drops its
+     tooltip downwards: the text belongs to what follows the heading. */
+  .help {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    font-weight: 600;
+    line-height: 1;
+    width: 17px;
+    height: 17px;
+    border-radius: 50%;
+    border: 1px solid var(--line);
+    background: var(--sunk);
+    color: var(--muted);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    vertical-align: 2px;
+    margin-left: 10px;
+  }
+  .help.src:hover, .help.src:focus-visible {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .help.src::after {
+    bottom: auto;
+    top: calc(100% + 9px);
+    left: -10px;
+    max-width: 420px;
+    transform: translateY(-4px);
+    font-weight: 400;
+  }
+  .help.src:hover::after, .help.src:focus-visible::after { transform: none; }
+
   /* The first body row has no room above it, so its tooltip drops below. */
   tbody tr:first-child .src::after {
     bottom: auto;

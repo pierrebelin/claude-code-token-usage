@@ -39,11 +39,13 @@ That reading grid is why the skill install beats a bare script.
 python3 ~/.claude/skills/token-usage/cc-usage.py --serve
 ```
 
-`http://127.0.0.1:8787/`, loopback only, re-runs the analysis on every load (~0.8 s).
-Home page: counters, cost per project, daily curve, session list. Each row opens its own
-page (~0.1 s), showing the session's own improvement leads, per-tool breakdown and every
-turn. A lead appears only when it accounts for at least 10% of that session and $0.25, so
-small categories do not turn into noise.
+`http://127.0.0.1:8787/`, loopback only, re-runs the analysis on every load (~1 s,
+plus ~0.5 s for the git correlation below — `--no-git` drops it).
+Home page: counters, cost per project, daily curve, session list. Each row carries the
+session's grade and opens its own page (~0.1 s), showing what that session could have
+avoided, the per-tool breakdown and every turn. A lead appears when it accounts for at
+least 10% of that session and $0.25 — or from $0.25 alone when it is unambiguous waste —
+so small categories do not turn into noise.
 
 ![Session page: what filled the context, then turn by turn](docs/dashboard-session.png)
 
@@ -71,6 +73,8 @@ ccusage --days 30 --sessions 10        # spot the costly session
 ccusage --session 46e2620d --top 15    # take it apart
 ccusage --days 30 --tools              # the same breakdown, summed over every session
 ccusage --days 7 --triage               # the few costly patterns worth opening
+ccusage --days 30 --yield              # what those sessions left in git
+ccusage --days 30 --audit              # every session graded A to F
 ```
 
 `--session` takes one session apart:
@@ -89,6 +93,78 @@ Read                       6         76.8k    2.94     3%
 `--tools` runs that attribution across the whole window and sums it, which turns an
 anecdote into a measure. It parses every transcript in the window — 2.4 s for 200
 sessions here — so it sits behind its own flag.
+
+## What it left in git
+
+```bash
+cc-usage.py --days 30 --yield
+```
+
+Cost answers *how much*. This answers *for what*. Each session is correlated with the
+commits its repository received while it was running — from two minutes before its first
+turn to half an hour after its last — and the outcome is read off git: the commit reached
+the mainline, it was reverted afterwards, it was committed and never merged, or the
+session ended without one.
+
+```
+Outcome                  Sess.    Cost $  Share
+Landed on the mainline     113  1,860.71    71%
+Reverted afterwards          0      0.00     0%
+Committed, never merged      2     15.30     1%
+No commit                   89    756.19    29%
+
+$9.12 per commit that landed, across 204 commits.
+```
+
+A commit belongs to the last session that was still running when it was authored, so two
+overlapping sessions never bank the same work. `No commit` is a category, not a verdict:
+reading, debugging and planning sessions legitimately end without one. What is worth
+watching is how much of the bill sits there, week after week.
+
+The mainline is `origin/HEAD` when the repo publishes one, then `main` or `master`. Only
+the repos that carry the most cost are queried — `--yield-max N`, eight by default — and
+the run says how many sessions that left out. `--no-git` never shells out to git at all,
+and the dashboard then drops the section.
+
+## A grade per session
+
+```bash
+cc-usage.py --days 30 --audit
+```
+
+Every session gets a letter, A to F. It grades **what that run could have avoided**, as a
+share of what the run cost — never its size. A twelve-hour session that wasted nothing
+scores A; a two-dollar one that spent a third of itself rebuilding its cache does not.
+
+```
+Session grades since 2026-08-02 — 204 of 204 sessions read
+  Median grade A (score 1.7)   A 145 · B 22 · C 19 · D 17 · F 1
+
+Grade  Session   Project            Cost $  Score  What weighs most
+F      74b68bee  HemicycleData       25.84     26  cache rebuilds 20% ($5.07)
+D      0121a476  Configurator.Back   57.38     21  cache rebuilds 12% ($6.79)
+D      716e04ac  Stid.Platform.SES   39.37     19  compaction 12% ($4.93)
+
+Avoidable across those sessions: replayed output $346.98, cache rebuilds $102.20,
+compaction $42.50, duplicate reads $1.00.
+```
+
+What weighs: files read out of `node_modules`, build output or lock files; the same file
+read again inside one context, compaction-reset and offset reads excluded; a prompt cache
+rebuilt after an idle gap; a compaction carried to the end of the session; replies still
+replayed past a fifth of the bill; and CLAUDE.md files past 8 kB, priced against the
+`(startup)` cost measured on that very session.
+
+What does not: subagents, and a heavy tool result. Both are leads worth opening — they
+appear in the list — but neither is a fault, so both score zero. A finding worth less than
+a couple of dollars fades in proportionally: a rate is not a problem when there is nothing
+to act on.
+
+The instructions are read from `~/.claude/CLAUDE.md` and the ones above the session's own
+directory, `@`-imports included. `--audit-max N` caps how many transcripts are parsed, 300
+by default, and the header states how many that was. The dashboard needs no flag: the
+sessions it lists are already parsed, so each row carries its letter and each session page
+opens on its grade.
 
 ## Status line
 
@@ -120,6 +196,9 @@ number you can still act on while the session is running.
 | `--models` / `--daily` | per-model / per-day breakdown |
 | `--tools` / `--tools-max N` | per-tool cost summed over the window (default cap: 500 sessions) |
 | `--triage` | the three costly patterns most worth inspecting |
+| `--yield` / `--yield-max N` | git outcome per session (default cap: 8 repos) |
+| `--audit` / `--audit-max N` | grade every session A to F (default cap: 300 sessions) |
+| `--no-git` | never shell out to git |
 | `--statusline` | one line for Claude Code's `statusLine` hook |
 | `--top N` | limit the display |
 | `--serve [PORT]` | live dashboard (default 8787) |
@@ -206,6 +285,9 @@ rather than an anecdote. Run it on yours; the shape holds, the numbers will not.
 - Day boundaries follow the machine's timezone, not the UTC the transcripts store.
 - LiteLLM prices, cached 24 h in `~/.cache/cc-usage/`. Offline with no cache: tokens
   counted, cost 0, reported explicitly.
+- `--yield` reads the local git history through read-only commands, and the grade reads
+  the CLAUDE.md files a session loaded. Nothing is written, nothing is sent; a repository
+  or a file that cannot be read is skipped rather than reported as a fault.
 - Two optional outbound requests, neither carrying your data: the LiteLLM price file
   (`--no-fetch`) and the Google Fonts the page loads. For zero external request, delete
   the three `<link>` tags in `cc-usage-template.html` — system fallbacks are declared.
