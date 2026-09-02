@@ -1,7 +1,6 @@
-# Claude Code Token Usage
+# Local agent usage
 
-What your Claude Code sessions cost, project by project, then what filled the context
-inside each one.
+Inspect Claude Code cost and Codex Desktop token usage locally, project by project.
 
 ![Usage dashboard: counters, daily curve and session list](docs/dashboard-overview.png)
 
@@ -16,9 +15,12 @@ The repository *is* a Claude Code skill. Clone it into `~/.claude/skills/`:
 git clone https://github.com/pierrebelin/claude-code-token-usage.git ~/.claude/skills/token-usage
 ```
 
-Copy **everything** — `SKILL.md`, `cc-usage.py`, `cc-usage-template.html`, `README.md`.
-The script looks for the template in its own directory, and the folder name is what
-`/token-usage` resolves to.
+Copy **everything** — `SKILL.md`, `cc-usage.py`, `codex-usage.py`, `codex_log.py`,
+`codex_grade.py`, `session_grade.py`, `usage-dashboard.py`,
+`usage-dashboard-template.html`, `dashboard_template.py`, `dashboard_model.py`,
+`usage-dashboard-base.css`, `README.md`.
+The script looks for the shared front and its local transformation layer in its
+own directory, and the folder name is what `/token-usage` resolves to.
 
 Then ask in plain language:
 
@@ -36,16 +38,34 @@ That reading grid is why the skill install beats a bare script.
 ## Dashboard
 
 ```bash
-python3 ~/.claude/skills/token-usage/cc-usage.py --serve
+python3 ~/.claude/skills/token-usage/usage-dashboard.py --serve
 ```
 
-`http://127.0.0.1:8787/`, loopback only, re-runs the analysis on every load (~1 s,
-plus ~0.5 s for the git correlation below — `--no-git` drops it).
+`http://127.0.0.1:8787/`, loopback only, re-runs the selected analysis on every load.
+The source switcher always selects one source: **Claude Code** is selected by default,
+and **Codex Desktop** exposes its observed token usage in the same layout. The period is
+kept when switching sources. Claude shows API-list-price cost; Codex does not claim a
+subscription cost.
+
 Home page: counters, cost per project, daily curve, session list. Each row carries the
-session's grade and opens its own page (~0.1 s), showing what that session could have
-avoided, the per-tool breakdown and every turn. A lead appears when it accounts for at
-least 10% of that session and $0.25 — or from $0.25 alone when it is unambiguous waste —
-so small categories do not turn into noise.
+session's grade and opens its own page (~0.1 s). That page is shared too: identity and
+headline figure, what the session could have avoided, how the context grew, what filled
+it, then every step. A lead appears when it accounts for at least 10% of that session
+and $0.25 — or from $0.25 alone when it is unambiguous waste — so small categories do not
+turn into noise.
+
+Codex fills that same page from what its journals actually hold. The unit is observed
+tokens rather than dollars, so a step is one counter interval instead of a turn and the
+headline is a token count — but the page is the same one, section for section, grade
+included. The last quota window and the records the reader skipped are folded into the
+session record at the bottom.
+
+One Codex particularity is worth knowing. The harness wraps every call in a small program,
+so the journal records them all under one name, `exec`. The reader unwraps it and reports
+the tool that was really invoked — `exec_command`, `apply_patch`, `web__run`, `mcp__*` —
+plus the command, query or file it pointed at, **cut at 40 characters**. That fragment is
+your own command lines and paths, so a `--dashboard report.html` you pass around carries
+it; tool *outputs*, prompts and model responses are never read.
 
 ![Session page: what filled the context, then turn by turn](docs/dashboard-session.png)
 
@@ -165,6 +185,30 @@ directory, `@`-imports included. `--audit-max N` caps how many transcripts are p
 by default, and the header states how many that was. The dashboard needs no flag: the
 sessions it lists are already parsed, so each row carries its letter and each session page
 opens on its grade.
+
+### The same letter on a Codex session
+
+Codex sessions are graded on the same bands, the same per-kind weights and the same
+fade-in — `session_grade.py` holds all three — with observed tokens where Claude Code has
+dollars. What differs is the evidence underneath, because the journal prices nothing and
+records no token figure for a single call:
+
+- a **step** is one counter interval plus the calls timestamped inside it, and a step's
+  observed tokens are split **equally** across those calls. That is an attribution, and
+  the page says so; the session total above it is the journal's own measurement;
+- **replayed output** is the running output total carried back into each later step,
+  capped at the input that step actually observed;
+- a **context re-sent uncached** is a step that read back less than half its input from
+  the cache while re-sending more than 20 k tokens — the counters state both;
+- a **repeated target** counts only when the journal kept the target whole. A target it
+  had to cut at 40 characters is not evidence: eight different URLs share the first forty
+  characters of one `curl` line;
+- **junk** is read out of that same bounded target: `node_modules/`, `dist/`, a lock file;
+- **instructions** are the `AGENTS.md` chain, from `~/.codex/AGENTS.md` and above the
+  session's directory, past 8 kB.
+
+Everything else works as it does for Claude Code: a heavy tool is a lead worth opening and
+scores zero, and a finding fades in below a couple of hundred thousand tokens.
 
 ## Status line
 
@@ -290,7 +334,7 @@ rather than an anecdote. Run it on yours; the shape holds, the numbers will not.
   or a file that cannot be read is skipped rather than reported as a fault.
 - Two optional outbound requests, neither carrying your data: the LiteLLM price file
   (`--no-fetch`) and the Google Fonts the page loads. For zero external request, delete
-  the three `<link>` tags in `cc-usage-template.html` — system fallbacks are declared.
+  the system-font declarations in `usage-dashboard-template.html`.
 
 ## Licence
 
