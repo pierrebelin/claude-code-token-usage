@@ -3,13 +3,13 @@ name: token-usage
 description: "Analyses Claude Code token usage and cost, per project and inside a single session. Answers questions like how much have I spent, which project costs the most, what filled the context, why was this session expensive."
 ---
 
-# Claude Code token usage
+# Claude Code and Codex usage
 
 Local tool that rebuilds usage from `~/.claude/projects/**/*.jsonl`.
 Nothing leaves the machine. No dependency beyond the Python 3.10+ stdlib.
 
 The script sits next to this file: `cc-usage.py`. So does the dashboard template:
-`cc-usage-template.html`. The script looks for the template in its own directory — moving
+`usage-dashboard-template.html`. The script looks for the template in its own directory — moving
 one without the other breaks `--dashboard`.
 
 ## When to use it
@@ -45,8 +45,8 @@ python3 $SKILL/cc-usage.py --days 30 --yield
 # every session in the window graded A to F on what it could have avoided
 python3 $SKILL/cc-usage.py --days 30 --audit
 
-# live dashboard, recomputed on every load
-python3 $SKILL/cc-usage.py --serve
+# combined live dashboard, recomputed on every load (Claude Code selected by default)
+python3 $SKILL/usage-dashboard.py --serve
 
 # frozen page, to archive or send
 python3 $SKILL/cc-usage.py --days 30 --dashboard ~/.claude/usage/report.html
