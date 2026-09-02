@@ -1,0 +1,2 @@
+{"type":"session_meta","timestamp":"2026-08-27T07:00:00Z","payload":{"session_id":"session-zero","cwd":"/workspace/zero-project","model_provider":"openai","timestamp":"2026-08-27T07:00:00Z"}}
+{"type":"event_msg","timestamp":"2026-08-27T07:00:05Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":0}},"rate_limits":null}}

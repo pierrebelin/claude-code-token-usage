@@ -1,5 +1,5 @@
 __pycache__/
 *.pyc
 *.html
-!cc-usage-template.html
+!usage-dashboard-template.html
 .DS_Store

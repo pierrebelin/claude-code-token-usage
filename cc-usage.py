@@ -19,6 +19,14 @@ from datetime import datetime, timedelta, timezone
 from html import escape as html_escape
 from pathlib import Path
 
+from dashboard_template import render_dashboard_document, source_tabs
+from dashboard_model import (claude_dashboard_model, clock as _clock,
+                             elapsed_label as _elapsed, metadata_list,
+                             render_dashboard_overview, render_session_view,
+                             shade as _shade, span_label as _span)
+from session_grade import (GRADE_WEIGHTS, grade_for, grade_session, grade_weight,
+                           is_junk)
+
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CACHE_PATH = Path.home() / ".cache" / "cc-usage" / "litellm-prices.json"
 PRICES_URL = (
@@ -848,40 +856,9 @@ TRIAGE_RESULT_LIMIT = 3
 SESSION_FINDING_MIN_SHARE = 0.10
 SESSION_FINDING_MIN_COST = 0.25
 
-# A grade reads one session, never the machine, and only the part of that run
-# which could have been avoided: junk loaded into context, the same file read
-# twice, a cache rebuilt after a pause, a compaction carried to the end, replies
-# replayed long after they mattered. Each weight is a share of what the session
-# itself cost, so a $2 run and a $200 run are graded on the same scale, and an
-# expensive session is never penalised for being expensive.
-GRADE_BANDS = ((3, "A"), (8, "B"), (15, "C"), (24, "D"))
-# kind -> factor applied to that share, cap, and the share below which it is free
-GRADE_WEIGHTS = {
-    "junk-reads": (1.2, 25.0, 0.0),
-    "duplicate-reads": (1.2, 20.0, 0.0),
-    "cache": (1.0, 20.0, 0.0),
-    "compaction": (1.0, 15.0, 0.0),
-    "replayed-output": (0.6, 15.0, 20.0),
-}
-# Below this, a share is still a share but there is nothing to act on: forty
-# cents rebuilt in a one-dollar session is a rate, not a problem. The weight
-# fades in up to it rather than landing whole.
-GRADE_MATERIAL = 2.0
+# The bands, the per-kind weights and the fade-in live in session_grade.py: the
+# Codex reader grades on the same scale, in its own unit.
 CLAUDE_MD_LIMIT = 8_000        # bytes, resent on every turn of every session
-JUNK_FRAGMENTS = ("/node_modules/", "/.git/", "/dist/", "/build/", "/.next/",
-                  "/target/", "/vendor/", "/.venv/", "/site-packages/",
-                  "/coverage/", "/__pycache__/", "/.terraform/", "/Pods/",
-                  "/.pytest_cache/", "/.mypy_cache/")
-JUNK_NAMES = ("package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
-              "Cargo.lock", "composer.lock", "Gemfile.lock", ".min.js", ".min.css",
-              ".js.map", ".css.map")
-
-
-def is_junk(path: str) -> bool:
-    """A path whose content is generated, vendored or locked: never worth context."""
-    lowered = path.replace("\\", "/")
-    return (any(fragment in lowered for fragment in JUNK_FRAGMENTS)
-            or lowered.endswith(JUNK_NAMES))
 
 
 def _read_text(path: Path) -> str:
@@ -931,24 +908,6 @@ def instruction_chain(cwd: str) -> list:
     _INSTRUCTIONS[cwd] = chain
     return chain
 
-
-def grade_for(score: float) -> str:
-    for ceiling, letter in GRADE_BANDS:
-        if score < ceiling:
-            return letter
-    return "F"
-
-
-def grade_weight(kind: str, share: float, cost: float) -> float:
-    """What one finding costs the grade: its share of the session, weighted."""
-    factor, cap, free = GRADE_WEIGHTS.get(kind, (0.0, 0.0, 0.0))
-    material = min(1.0, cost / GRADE_MATERIAL)
-    return min(cap, factor * max(0.0, share - free)) * material
-
-
-def grade_session(detail: dict) -> tuple:
-    score = sum(finding["weight"] for finding in detail.get("triage") or [])
-    return round(score, 1), grade_for(score)
 
 SESSION_SORTS = {
     "cost-desc": "Costliest first",
@@ -1630,8 +1589,6 @@ def _tokens(n: float) -> str:
     return str(int(round(n)))
 
 
-MONTHS_SHORT = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 MONTHS_LONG = ("January", "February", "March", "April", "May", "June", "July",
                "August", "September", "October", "November", "December")
 
@@ -1699,44 +1656,9 @@ def audit_sessions(session_buckets, table, memo,
     }
 
 
-def _clock(iso: str | None) -> str:
-    if not iso:
-        return "\u2014"
-    try:
-        moment = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
-    except (ValueError, AttributeError):
-        return "\u2014"
-    return f"{MONTHS_SHORT[moment.month - 1]} {moment.day} {moment:%H:%M}"
-
-
 def _day(iso: str) -> str:
     moment = datetime.fromisoformat(iso)
     return f"{MONTHS_LONG[moment.month - 1]} {moment.day}"
-
-
-def _moment(iso: str | None):
-    try:
-        return datetime.fromisoformat((iso or "").replace("Z", "+00:00")).astimezone()
-    except (ValueError, AttributeError):
-        return None
-
-
-def _span(start: str, end: str) -> str:
-    """Start and end of a session, with the date written once when it is the same."""
-    a, b = _moment(start), _moment(end)
-    if a and b and a.date() == b.date():
-        return f"{_clock(start)} \u2192 {b:%H:%M}"
-    return f"{_clock(start)} \u2192 {_clock(end)}"
-
-
-def _elapsed(start: str, end: str) -> str:
-    a, b = _moment(start), _moment(end)
-    if not a or not b:
-        return ""
-    minutes = int((b - a).total_seconds() // 60)
-    if minutes < 60:
-        return f"{minutes} min"
-    return f"{minutes // 60} h {minutes % 60:02d}"
 
 
 SOURCE_TIPS = {
@@ -1870,18 +1792,6 @@ def _grade_chip(session: dict, focusable: bool = True) -> str:
             f'data-tip="{html_escape(tip)}">{grade}</span>')
 
 
-def _help(text: str) -> str:
-    """A section's explanation, folded into one mark beside its title.
-
-    On a session page the headings carry most of the navigation, and a
-    paragraph under each of them pushes the figures down the screen. The prose
-    is worth keeping, so it moves one hover away rather than disappearing.
-    """
-    tip = html_escape(text)
-    return (f'<span class="help src" tabindex="0" aria-label="{tip}" '
-            f'data-tip="{tip}">?</span>')
-
-
 def _th(label: str, numeric: bool = False) -> str:
     """A column header that explains itself on hover, reusing the .src tooltip."""
     tip = COLUMN_TIPS.get(label)
@@ -1890,11 +1800,6 @@ def _th(label: str, numeric: bool = False) -> str:
         return f"{cell}{html_escape(label)}</th>"
     return (f'{cell}<span class="src" tabindex="0" data-tip="{html_escape(tip)}">'
             f"{html_escape(label)}</span></th>")
-
-
-def _shade(index: int, count: int) -> str:
-    mix = 18 + (index / max(1, count - 1)) * 52
-    return f"color-mix(in oklab, var(--accent) {100 - mix:.0f}%, var(--sunk))"
 
 
 def _query(params: dict, **overrides) -> str:
@@ -1908,6 +1813,7 @@ def _state(payload: dict) -> dict:
     listing = payload.get("listing") or {}
     days = payload["window"].get("days")
     return {
+        "source": payload.get("dashboard_source", ""),
         "days": days or "",
         "sort": listing.get("sort_sessions", ""),
         "q": listing.get("filter_sessions", ""),
@@ -1952,247 +1858,199 @@ def _turn_form(payload: dict, action: str = "") -> str:
         + '<button type="submit">Apply</button>' + reset + "</form>")
 
 
-def render_context_chart(session: dict) -> str:
+def _claude_chart(session: dict) -> dict | None:
     """The context, turn by turn, with the commands that moved it.
 
     The turn table sorted by cost tells you which call was expensive. It cannot
     show the shape: the startup plateau, the step a big read leaves behind, the
     cliff a compaction cuts. That shape is what the curve is for.
     """
-    esc = html_escape
     curve = session.get("curve") or []
     if len(curve) < 2:
-        return ""
-    # The bottom padding holds two rows below the plot: the turn axis, then the
-    # strip the hover readout is written into. Keeping the readout out of the
-    # plot is the point of it — a line of text laid over the curve competes with
-    # it, and on a dense session it lands on the very peak being read.
-    W, H, PAD_L, PAD_R, PAD_T, PAD_B = 1000, 322, 58, 16, 64, 68
-    inner_w, inner_h = W - PAD_L - PAD_R, H - PAD_T - PAD_B
-    axis_y = PAD_T + inner_h + 19
-    strip_y, strip_h = PAD_T + inner_h + 30, 26
-    peak = max(point["ctx"] for point in curve) or 1
-    span = max(1, len(curve) - 1)
-    uid = esc(session["short"])
-
-    def px(i):
-        return PAD_L + (i / span) * inner_w
-
-    def py(v):
-        return PAD_T + inner_h - (v / peak) * inner_h
-
-    svg = [f'<svg viewBox="0 0 {W} {H}" role="img" '
-           f'aria-label="Context size turn by turn">',
-           f'<defs><linearGradient id="ctxFade-{uid}" x1="0" y1="0" x2="0" y2="1">'
-           '<stop class="ctx-fade-top" offset="0"/>'
-           '<stop class="ctx-fade-bottom" offset="1"/></linearGradient></defs>']
-    for frac in (0, 0.5, 1):
-        y = PAD_T + inner_h * frac
-        svg.append(f'<line class="grid-line" x1="{PAD_L}" y1="{y:.1f}" '
-                   f'x2="{W - PAD_R}" y2="{y:.1f}"/>')
-        svg.append(f'<text class="axis" x="{PAD_L - 10}" y="{y + 3.5:.1f}" '
-                   f'text-anchor="end">{_tokens(peak * (1 - frac))}</text>')
-
-    path = " ".join(f'{"L" if i else "M"}{px(i):.1f},{py(point["ctx"]):.1f}'
-                    for i, point in enumerate(curve))
-    svg.append(f'<path d="{path} L{px(span):.1f},{PAD_T + inner_h:.1f} '
-               f'L{PAD_L},{PAD_T + inner_h:.1f} Z" fill="url(#ctxFade-{uid})"/>')
-    svg.append(f'<path class="spark" d="{path}"/>')
-    svg.append(f'<rect class="readout-strip" x="{PAD_L}" y="{strip_y}" '
-               f'width="{inner_w}" height="{strip_h}" rx="7"/>')
-    svg.append(f'<text class="readout-idle" x="{PAD_L + 12}" '
-               f'y="{strip_y + 17.5:.1f}">hover the curve for the turn behind any '
-               "point</text>")
-
-    # Every re-baselining, named: a compaction is not a rewind.
-    for i, point in enumerate(curve):
-        if not point.get("reset") or i == 0:
-            continue
-        x = px(i)
-        tag = "compaction" if point["tool"] == "(compaction)" else "reset"
-        anchor = "end" if x > PAD_L + inner_w * 0.85 else "start"
-        shift = -4 if anchor == "end" else 4
-        svg.append(f'<line class="reset-line" x1="{x:.1f}" y1="{PAD_T}" '
-                   f'x2="{x:.1f}" y2="{PAD_T + inner_h:.1f}"/>')
-        svg.append(f'<text class="reset-tag" x="{x + shift:.1f}" y="16" '
-                   f'text-anchor="{anchor}">{tag}</text>')
-
-    # The handful of turns that actually moved the curve, labelled in place. Only
-    # real commands qualify: the reply replayed on every turn is not an event, and
-    # two labels closer than a fifth of the width would overprint each other.
+        return None
     dull = {"(replayed output)", "(no tool)"}
-    chosen: list[tuple[int, dict]] = []
-    for point in sorted(curve, key=lambda d: -d["added"]):
-        if point.get("reset") or point["tool"] in dull or not point["added"]:
-            continue
-        i = curve.index(point)
-        if any(abs(px(i) - px(j)) < inner_w * 0.2 for j, _p in chosen):
-            continue
-        chosen.append((i, point))
-        if len(chosen) == 4:
-            break
-    for row, (i, point) in enumerate(sorted(chosen)):
-        x, y = px(i), py(point["ctx"])
-        top = PAD_T - 32 + (row % 2) * 15
-        anchor = "end" if x > PAD_L + inner_w * 0.72 else "start"
-        shift = -7 if anchor == "end" else 7
-        svg.append(f'<line class="peak-stem" x1="{x:.1f}" y1="{y:.1f}" '
-                   f'x2="{x:.1f}" y2="{top + 3}"/>')
-        svg.append(f'<circle class="peak-dot" cx="{x:.1f}" cy="{y:.1f}" r="3.5"/>')
-        svg.append(f'<text class="peak-tag" x="{x + shift:.1f}" y="{top + 6}" '
-                   f'text-anchor="{anchor}">{esc(_short(point["label"], 34))}</text>')
-
-    # One hover band per turn, each with the readout it reveals. A native <title>
-    # would be lighter, but it takes a second to appear and the rest of the page
-    # answers instantly; the guide, the dot and the line of text are pure CSS.
-    band = inner_w / max(1, span)
-    for i, point in enumerate(curve):
-        x, y = px(i), py(point["ctx"])
-        readout = (f'turn {point["turn"]} \u00b7 {esc(point["label"])} \u00b7 '
-                   f'+{_tokens(point["added"])} \u00b7 ${_money(point["cost"])} '
-                   f'\u00b7 ctx {_tokens(point["ctx"])}')
-        # The band reaches down over the strip, so moving onto the line of text
-        # does not dismiss it halfway through.
-        svg.append(f'<rect class="hit" x="{x - band / 2:.1f}" y="{PAD_T}" '
-                   f'width="{band:.2f}" '
-                   f'height="{strip_y + strip_h - PAD_T:.1f}"/>')
-        # The text sits at a fixed spot rather than following the cursor: it can
-        # never run off the edge, and it does not jitter while being read.
-        svg.append(
-            f'<g class="readout">'
-            f'<line class="guide" x1="{x:.1f}" y1="{PAD_T}" '
-            f'x2="{x:.1f}" y2="{PAD_T + inner_h:.1f}"/>'
-            f'<circle class="guide-dot" cx="{x:.1f}" cy="{y:.1f}" r="4"/>'
-            f'<text class="readout-tag" x="{PAD_L + 12}" '
-            f'y="{strip_y + 17.5:.1f}">{readout}</text></g>')
-    for i in (0, span // 2, span):
-        anchor = "start" if i == 0 else "end" if i == span else "middle"
-        svg.append(f'<text class="axis" x="{px(i):.1f}" y="{axis_y}" '
-                   f'text-anchor="{anchor}">turn {curve[i]["turn"]}</text>')
-    svg.append("</svg>")
-
-    legend = ('<div class="legend"><span><i></i>context carried into the turn</span>'
-              '<span><i class="peak"></i>biggest additions</span>')
-    if any(point.get("reset") for point in curve[1:]):
-        legend += '<span><i class="dashed"></i>context re-based</span>'
-    legend += "</div>"
-    return f'<div class="chart">{"".join(svg)}</div>{legend}'
+    points = [{
+        "x": f'turn {point["turn"]}',
+        "value": point["ctx"],
+        "label": point["label"],
+        "added": point["added"],
+        "dull": point["tool"] in dull,
+        "reset": bool(point.get("reset")),
+        "reset_tag": "compaction" if point["tool"] == "(compaction)" else "reset",
+        "readout": (f'turn {point["turn"]} · {point["label"]} · '
+                    f'+{_tokens(point["added"])} · ${_money(point["cost"])} '
+                    f'· ctx {_tokens(point["ctx"])}'),
+    } for point in curve]
+    legend = [("", "context carried into the turn"), ("peak", "biggest additions")]
+    if any(point["reset"] for point in points[1:]):
+        legend.append(("dashed", "context re-based"))
+    return {
+        "id": session["short"],
+        "title": "How the context grew",
+        "label": "Context size turn by turn",
+        "hint": ("The context carried into each turn, in order. Every turn pays for "
+                 "the whole height of the curve under it, which is why a step early "
+                 "on costs more than the same step late. Hover any point for the "
+                 "command behind it."),
+        "idle": "hover the curve for the turn behind any point",
+        "points": points,
+        "legend": legend,
+    }
 
 
-def render_session_triage(session: dict) -> list:
+def _claude_triage(session: dict) -> dict | None:
     """The session's grade, and the leads it is made of."""
-    esc = html_escape
     findings = sorted(session.get("triage") or [],
                       key=lambda finding: (-finding["weight"], -finding["cost"]))
     grade = session.get("grade")
     if not grade and not findings:
-        return []
+        return None
     avoidable = sum(finding["cost"] for finding in findings
                     if finding["weight"] and finding["kind"] in GRADE_WEIGHTS)
-    hint = _help("The letter grades this session and nothing wider: what the run "
+    stats = [
+        {"label": "Grade", "value": grade or "—", "tone": f"g{(grade or '').lower()}",
+         "tip": "A to F, from what this session could have avoided as a share of what "
+                "it cost — never from its size. The bands are A under 3, B under "
+                "8, C under 15, D under 24, F beyond."},
+        {"label": "Score", "value": f'{session.get("score") or 0:.0f}',
+         "tip": "The weighted sum of the leads below. Each one weighs its own share of "
+                "the session, capped per kind, and fades in under a couple of dollars: "
+                "a bad rate on small change is a rate, not something to act on."},
+        {"label": "Avoidable", "value": "$" + _money(avoidable),
+         "tip": "What the leads that weigh cost together: junk or duplicate reads, a "
+                "cache rebuilt after an idle gap, a compaction carried to the end, "
+                "replies replayed past a fifth of the bill. Leads that score nothing "
+                "are left out."},
+        {"label": "Leads", "value": str(len(findings)),
+         "tip": "How many patterns were found here, weighing or not. Subagents and a "
+                "heavy tool result are listed but score zero: worth opening, not "
+                "faults."},
+    ]
+    return {
+        "title": "What this session could have avoided",
+        "hint": ("The letter grades this session and nothing wider: what the run "
                  "could have avoided, as a share of what it cost. Being long or "
-                 "expensive is not a fault \u2014 a heavy subagent or tool result is a "
+                 "expensive is not a fault — a heavy subagent or tool result is a "
                  "lead worth opening, and weighs nothing on the grade. Leads appear "
                  "from 10% of the session and $0.25; junk reads, duplicate reads and "
-                 "oversized instructions from $0.25 alone.")
-    out = ['<section class="triage">',
-           f"<h2>What this session could have avoided{hint}</h2>"]
-    stats = [
-        ("Grade", grade or "\u2014", f"g{(grade or '').lower()}",
-         "A to F, from what this session could have avoided as a share of what it "
-         "cost \u2014 never from its size. The bands are A under 3, B under 8, C "
-         "under 15, D under 24, F beyond."),
-        ("Score", f'{session.get("score") or 0:.0f}', "",
-         "The weighted sum of the leads below. Each one weighs its own share of the "
-         "session, capped per kind, and fades in under a couple of dollars: a bad "
-         "rate on small change is a rate, not something to act on."),
-        ("Avoidable", "$" + _money(avoidable), "",
-         "What the leads that weigh cost together: junk or duplicate reads, a cache "
-         "rebuilt after an idle gap, a compaction carried to the end, replies "
-         "replayed past a fifth of the bill. Leads that score nothing are left out."),
-        ("Leads", str(len(findings)), "",
-         "How many patterns were found here, weighing or not. Subagents and a heavy "
-         "tool result are listed but score zero: worth opening, not faults."),
-    ]
-    out.append('<div class="headline tipped">')
-    for label, value, tone, tip in stats:
-        cls = "stat lead" if tone else "stat"
-        mark = f' class="{tone}"' if tone else ""
-        out.append(f'<div class="{cls}"><span class="eyebrow src" tabindex="0" '
-                   f'data-tip="{esc(tip)}">{esc(label)}</span>'
-                   f"<b{mark}>{esc(str(value))}</b></div>")
-    out.append("</div>")
-    if not findings:
-        out.append('<p class="note">Nothing stood out: no junk read, no file read '
-                   "twice, no cache rebuilt after a pause.</p></section>")
-        return out
-    out.append('<div class="triage-list">')
-    for rank, finding in enumerate(findings, 1):
-        penalty = (f'{finding["weight"]:.0f} of the score' if finding["weight"]
-                   else "no penalty")
-        items = "".join(f"<li>{esc(item)}</li>" for item in finding.get("items") or [])
-        out.append(
-            '<article class="triage-item">'
-            f'<span class="triage-rank">{rank:02d}</span>'
-            '<div class="triage-main">'
-            f'<div class="triage-title"><b>${_money(finding["cost"])}</b>'
-            f'<span class="triage-share">{finding["share"]:.0f}% of the session '
-            f'\u00b7 {esc(penalty)}</span></div>'
-            f'<p>{esc(finding["reason"])}</p>'
-            + (f'<ul class="triage-items">{items}</ul>' if items else "")
-            + f'<p class="triage-advice">{esc(finding["advice"])}</p>'
-            '<ul class="triage-tips">'
-            + "".join(f"<li>{esc(tip)}</li>" for tip in finding["tips"])
-            + "</ul>"
-            "</div></article>")
-    out.append("</div>")
-    out.append("</section>")
-    return out
+                 "oversized instructions from $0.25 alone."),
+        "stats": stats,
+        "findings": [{
+            "value": "$" + _money(finding["cost"]),
+            "share": (f'{finding["share"]:.0f}% of the session · '
+                      + (f'{finding["weight"]:.0f} of the score' if finding["weight"]
+                         else "no penalty")),
+            "reason": finding["reason"],
+            "items": finding.get("items") or [],
+            "advice": finding["advice"],
+            "tips": finding["tips"],
+        } for finding in findings],
+        "note": ("Nothing stood out: no junk read, no file read twice, no cache "
+                 "rebuilt after a pause."),
+    }
 
 
-def render_session_detail(session: dict, payload: dict, standalone: bool) -> list:
-    """Renders one session: headline figures, per-tool breakdown, turns."""
-    esc = html_escape
-    out = []
-    compact_plural = "s" if session["compactions"] != 1 else ""
-    prompt_plural = "s" if session["prompts"] != 1 else ""
-    turn_plural = "s" if session["turns"] != 1 else ""
+def _column_spec(label: str, numeric: bool = False) -> dict:
+    """A column of the session tables, carrying its own explanation."""
+    return {"label": label, "n": numeric, "tip": COLUMN_TIPS.get(label)}
+
+
+def _claude_sections(session: dict, payload: dict, standalone: bool) -> list:
+    """Everything below the curve: what filled the context, then every turn."""
+    sources = [source for source in session["sources"] if source["cost"] > 0]
+    total_sources = sum(source["cost"] for source in sources) or 1
+    breakdown = {
+        "title": "What filled the context",
+        "hint": ("Every turn resends the whole accumulated context, so a source costs "
+                 "its own size multiplied by the number of later turns that carry it "
+                 "— an attribution, where the session total above is measured. "
+                 "Hover any source or column header for what it means."),
+        "stack": [{"share": source["cost"] / total_sources * 100,
+                   "color": _shade(index, len(sources)),
+                   "title": f'{source["tool"]} — ${_money(source["cost"])}'}
+                  for index, source in enumerate(sources)],
+        "columns": [_column_spec("Source"), _column_spec("Calls", True),
+                    _column_spec("Tokens added", True), _column_spec("Avg call", True),
+                    _column_spec("Cost", True), _column_spec("Share", True)],
+        "rows": [[
+            {"text": source["tool"], "swatch": _shade(index, len(sources)),
+             "tip": source_tip(source["tool"], source["count"])},
+            {"text": source["count"], "n": True},
+            {"text": _tokens(source["added"]), "n": True},
+            {"text": _tokens(source["added"] / max(1, source["count"])), "n": True},
+            {"text": "$" + _money(source["cost"]), "n": True},
+            {"text": f'{round(source["cost"] / total_sources * 100)} %', "n": True},
+        ] for index, source in enumerate(sources)],
+        "empty": "No source carried a cost in this session.",
+    }
+
+    rows = session["entries"]
+    turn_total = sum(entry["cost"] for entry in rows) or 1
+    turns = {
+        "title": "Turn by turn",
+        "controls": (_turn_form(payload, action="/session")
+                     if payload.get("served") else ""),
+        "columns": [_column_spec("Turn", True), _column_spec("What the turn added"),
+                    _column_spec("Tokens", True), _column_spec("Context", True),
+                    _column_spec("Cost", True), _column_spec("Share", True)],
+        "rows": [[
+            {"text": entry["turn"], "n": True},
+            {"text": entry["label"], "label": True, "title": entry["label"]},
+            {"text": _tokens(entry["added"]), "n": True},
+            {"text": _tokens(entry["ctx"]), "n": True},
+            {"text": "$" + _money(entry["cost"]), "n": True},
+            {"text": f'{round(100 * entry["cost"] / turn_total)} %', "n": True},
+        ] for entry in rows],
+        "empty": "No turn matches the filter.",
+        "notes": [],
+    }
+    total_rows = session.get("entries_total", len(rows))
+    if rows and total_rows > len(rows):
+        turns["notes"].append(f"{len(rows)} of {total_rows} matching turns shown.")
+    sections = [breakdown, turns]
+
+    if session.get("agents"):
+        sections.append({
+            "title": "Subagents",
+            "hint": ("Each runs its own context, off the main chain. What the main "
+                     "session paid is only the report handed back — the Agent "
+                     "line above; what the run itself cost is here."),
+            "columns": ["Agent", _column_spec("Type"), _column_spec("Turns", True),
+                        _column_spec("Output", True), _column_spec("Cost", True)],
+            "rows": [[
+                {"text": agent["label"], "label": True, "title": agent["label"]},
+                agent["type"] or "—",
+                {"text": agent["turns"], "n": True},
+                {"text": _tokens(agent["output"]), "n": True},
+                {"text": "$" + _money(agent["cost"]), "n": True},
+            ] for agent in session["agents"]],
+        })
 
     if standalone:
-        state = _state(payload)
-        if payload.get("served"):
-            out.append(f'<a class="back" href="/{esc(_query(state))}">All sessions</a>')
-        out.append('<header class="hero">')
-        out.append('<div class="hero-left">')
-        out.append('<div class="hero-top"><span class="eyebrow">Session</span>'
-                   f'<span class="id">{esc(session["short"])}</span>'
-                   + (f'<span class="branch">{esc(session["branch"])}</span>'
-                      if session.get("branch") else "")
-                   + "</div>")
-        out.append(f'<h1>{esc(session["project"])}</h1>')
-        out.append(f'<div class="identity"><span class="hero-cost"><span>$</span>'
-                   f'{_money(session["cost"])}</span>'
-                   f'{_chip(session["exact"])}{_grade_chip(session)}</div>')
-        run = [f'<span>{esc(_span(session["start"], session["end"]))}</span>']
-        elapsed = _elapsed(session["start"], session["end"])
-        if elapsed:
-            run.append(f'<span><b>{esc(elapsed)}</b> elapsed</span>')
-        run += [
-            f'<span><b>{session["turns"]}</b> turn{turn_plural}</span>',
-            f'<span><b>{session["prompts"]}</b> prompt{prompt_plural}</span>',
-            f'<span><b>{session["compactions"]}</b> compaction{compact_plural}</span>',
-        ]
-        out.append("</div>")
-        out.append('<div class="hero-meta">' + "".join(run) + "</div>")
-        out.append("</header>")
+        sections.append({
+            "title": "Session record",
+            "hint": "What the transcript states about the run itself, unaggregated.",
+            "html": metadata_list([
+                ("Session", session["id"]),
+                ("Project", session["project"]),
+                ("Working directory", session["cwd"] or "—"),
+                ("Branch", session.get("branch") or "—"),
+                ("Started", _clock(session["start"])),
+                ("Ended", _clock(session["end"])),
+                ("Cost figure", "counter" if session["exact"] else "transcript floor"),
+                ("Slash commands", ", ".join(session["commands"]) or "—"),
+            ]),
+        })
+    return sections
 
+
+def claude_session_view(session: dict, payload: dict, standalone: bool) -> dict:
+    """Normalize one Claude session for the shared session front."""
     billed = session.get("billed") or {}
     billed_total = billed.get("total") or 0
     cache = session.get("cache") or {}
-    facts = [
-        ("Context", "$" + _money(session["cost_context"])),
-        ("Generation", "$" + _money(session["cost_output"])),
-    ]
+    facts = [("Context", "$" + _money(session["cost_context"])),
+             ("Generation", "$" + _money(session["cost_output"]))]
     if session.get("cost_agents"):
         facts.append(("Subagents", "$" + _money(session["cost_agents"])))
     if cache.get("count"):
@@ -2201,7 +2059,7 @@ def render_session_detail(session: dict, payload: dict, standalone: bool) -> lis
         ("Input tokens billed", _tokens(billed_total)),
         ("Served from cache",
          f'{round(100 * billed.get("cache_read", 0) / billed_total)} %'
-         if billed_total else "\u2014"),
+         if billed_total else "—"),
         ("Written to cache", _tokens(billed.get("cache_write", 0))),
         ("Uncached input", _tokens(billed.get("fresh", 0))),
         ("Tokens produced", _tokens(session["output"])),
@@ -2210,128 +2068,65 @@ def render_session_detail(session: dict, payload: dict, standalone: bool) -> lis
         (("Accounted for by transcript", f'{session["restitution"]} %')
          if session["exact"] else ("Internal counter", "missing")),
     ]
-    out.append('<div class="facts">')
-    for label, value in facts:  # noqa: B007 - label drives the tooltip lookup
-        tip = FACT_TIPS.get(label)
-        eyebrow = (f'<span class="eyebrow src" tabindex="0" data-tip="{esc(tip)}">'
-                   f"{esc(label)}</span>" if tip
-                   else f'<span class="eyebrow">{esc(label)}</span>')
-        out.append(f'<div class="fact">{eyebrow}'
-                   f"<b>{esc(str(value))}</b></div>")
-    out.append("</div>")
 
-    if standalone:
-        out += render_session_triage(session)
+    run = [{"label": _span(session["start"], session["end"])}]
+    if elapsed := _elapsed(session["start"], session["end"]):
+        run.append({"value": elapsed, "label": "elapsed"})
+    run += [
+        {"value": str(session["turns"]),
+         "label": "turn" + ("s" if session["turns"] != 1 else "")},
+        {"value": str(session["prompts"]),
+         "label": "prompt" + ("s" if session["prompts"] != 1 else "")},
+        {"value": str(session["compactions"]),
+         "label": "compaction" + ("s" if session["compactions"] != 1 else "")},
+    ]
 
-    chart = render_context_chart(session)
-    if chart:
-        out.append("<section>")
-        hint = _help("The context carried into each turn, in order. Every turn "
-                     "pays for the whole height of the curve under it, which is why "
-                     "a step early on costs more than the same step late. Hover any "
-                     "point for the command behind it.") if standalone else ""
-        out.append(f"<h2>How the context grew{hint}</h2>")
-        out.append(chart)
-        out.append("</section>")
+    badges = [{"kind": "exact" if session["exact"] else "floor",
+               "label": "exact" if session["exact"] else "floor",
+               "tip": EXACT_TIP if session["exact"] else FLOOR_TIP}]
+    if grade := session.get("grade"):
+        badges.append({"kind": f"grade g{grade.lower()}", "label": grade,
+                       "tip": GRADE_TIP.format(grade=grade,
+                                               score=session.get("score") or 0)})
 
-    sources = [src for src in session["sources"] if src["cost"] > 0]
-    total_sources = sum(src["cost"] for src in sources) or 1
-    out.append("<section>")
-    hint = _help("Every turn resends the whole accumulated context, so a source "
-                 "costs its own size multiplied by the number of later turns that "
-                 "carry it \u2014 an attribution, where the session total above is "
-                 "measured. Hover any source or column header for what it means."
-                 ) if standalone else ""
-    out.append(f"<h2>What filled the context{hint}</h2>")
-    out.append('<div class="stack">')
-    for i, src in enumerate(sources):
-        share = (src["cost"] / total_sources) * 100
-        out.append(f'<span style="width:{share:.2f}%;background:{_shade(i, len(sources))}" '
-                   f'title="{esc(src["tool"])} — ${_money(src["cost"])}"></span>')
-    out.append("</div>")
-    out.append('<div class="scroll"><table><thead><tr>'
-               + _th("Source") + _th("Calls", numeric=True)
-               + _th("Tokens added", numeric=True) + _th("Avg call", numeric=True)
-               + _th("Cost", numeric=True) + _th("Share", numeric=True)
-               + "</tr></thead><tbody>")
-    for i, src in enumerate(sources):
-        share = round((src["cost"] / total_sources) * 100)
-        out.append(
-            f'<tr><td><span class="swatch" style="background:{_shade(i, len(sources))}">'
-            f'</span><span class="src" tabindex="0" '
-            f'data-tip="{esc(source_tip(src["tool"], src["count"]))}">'
-            f'{esc(src["tool"])}</span></td>'
-            f'<td class="n">{src["count"]}</td>'
-            f'<td class="n">{_tokens(src["added"])}</td>'
-            f'<td class="n">{_tokens(src["added"] / max(1, src["count"]))}</td>'
-            f'<td class="n">${_money(src["cost"])}</td>'
-            f'<td class="n">{share} %</td></tr>')
-    out.append("</tbody></table></div>")
-    out.append("</section>")
-
-    out.append("<section>")
-    out.append("<h2>Turn by turn</h2>")
-    if standalone and payload.get("served"):
-        out.append(f'<div class="filters">{_turn_form(payload, action="/session")}</div>')
-    rows = session["entries"]
-    if rows:
-        turn_total = sum(e["cost"] for e in rows) or 1
-        out.append('<div class="scroll"><table><thead><tr>'
-                   + _th("Turn", numeric=True) + _th("What the turn added")
-                   + _th("Tokens", numeric=True) + _th("Context", numeric=True)
-                   + _th("Cost", numeric=True) + _th("Share", numeric=True)
-                   + "</tr></thead><tbody>")
-        for entry in rows:
-            out.append(
-                f'<tr><td class="n">{entry["turn"]}</td>'
-                f'<td class="label" title="{esc(entry["label"])}">{esc(entry["label"])}</td>'
-                f'<td class="n">{_tokens(entry["added"])}</td>'
-                f'<td class="n">{_tokens(entry["ctx"])}</td>'
-                f'<td class="n">${_money(entry["cost"])}</td>'
-                f'<td class="n">{round(100 * entry["cost"] / turn_total)} %</td></tr>')
-        out.append("</tbody></table></div>")
-        total_rows = session.get("entries_total", len(rows))
-        if total_rows > len(rows):
-            out.append(f'<p class="note">{len(rows)} of {total_rows} matching turns '
-                       "shown.</p>")
-    else:
-        out.append('<p class="empty">No turn matches the filter.</p>')
-    out.append("</section>")
-
-    if session.get("agents"):
-        out.append("<section>")
-        hint = _help("Each runs its own context, off the main chain. What the main "
-                     "session paid is only the report handed back \u2014 the Agent "
-                     "line above; what the run itself cost is here.") if standalone else ""
-        out.append(f"<h2>Subagents{hint}</h2>")
-        out.append('<div class="scroll"><table><thead><tr><th>Agent</th>'
-                   + _th("Type") + _th("Turns", numeric=True)
-                   + _th("Output", numeric=True) + _th("Cost", numeric=True)
-                   + "</tr></thead><tbody>")
-        for agent in session["agents"]:
-            out.append(f'<tr><td class="label" title="{esc(agent["label"])}">'
-                       f'{esc(agent["label"])}</td>'
-                       f'<td>{esc(agent["type"] or "\u2014")}</td>'
-                       f'<td class="n">{agent["turns"]}</td>'
-                       f'<td class="n">{_tokens(agent["output"])}</td>'
-                       f'<td class="n">${_money(agent["cost"])}</td></tr>')
-        out.append("</tbody></table></div>")
-        out.append("</section>")
-
+    notes = []
     if cache.get("count"):
         gap = cache.get("median_gap")
         when = f", after a {gap / 60:.0f} min pause on median" if gap else ""
         plural = "s" if cache["count"] != 1 else ""
-        out.append(f'<p class="note">The prompt cache had expired on '
-                   f'{cache["count"]} turn{plural}{when}: {_tokens(cache["tokens"])} '
-                   f"tokens were written again rather than read back, "
-                   f"${_money(cache['extra_cost'])} of avoidable cost.</p>")
-
+        notes.append(f'The prompt cache had expired on {cache["count"]} turn{plural}'
+                     f'{when}: {_tokens(cache["tokens"])} tokens were written again '
+                     f"rather than read back, ${_money(cache['extra_cost'])} of "
+                     "avoidable cost.")
     if session["skills"]:
-        listing = ", ".join(f'{esc(k["name"])} (${_money(k["cost"])})'
-                            for k in session["skills"])
-        out.append(f'<p class="note">Turns attributed to a skill: {listing}.</p>')
-    return out
+        listing = ", ".join(f'{skill["name"]} (${_money(skill["cost"])})'
+                            for skill in session["skills"])
+        notes.append(f"Turns attributed to a skill: {listing}.")
+
+    view = {
+        "eyebrow": "Session",
+        "id": session["short"],
+        "tags": [session["branch"]] if session.get("branch") else [],
+        "title": session["project"],
+        "metric": {"prefix": "$", "value": _money(session["cost"])},
+        "badges": badges,
+        "run": run,
+        "facts": [{"label": label, "value": value, "tip": FACT_TIPS.get(label)}
+                  for label, value in facts],
+        "triage": _claude_triage(session),
+        "chart": _claude_chart(session),
+        "sections": _claude_sections(session, payload, standalone),
+        "notes": notes,
+    }
+    if payload.get("served"):
+        view["back"] = {"href": "/" + _query(_state(payload)), "label": "All sessions"}
+    return view
+
+
+def render_session_detail(session: dict, payload: dict, standalone: bool) -> list:
+    """Renders one session through the front shared with the other sources."""
+    return [render_session_view(claude_session_view(session, payload, standalone),
+                                standalone)]
 
 
 def render_yield(payload: dict) -> list:
@@ -2521,10 +2316,10 @@ def render_footer(payload: dict) -> list:
 
 
 def render_session_page(payload: dict) -> str:
-    out = ['<div class="wrap">']
+    out = ['<main class="wrap" id="top">']
     out += render_session_detail(payload["focus"], payload, standalone=True)
     out += render_footer(payload)
-    out.append("</div>")
+    out.append("</main>")
     return "\n".join(out)
 
 
@@ -2533,7 +2328,7 @@ def window_meta(since, days) -> dict:
             "label": f"since {since.date()}" if since else "all history"}
 
 
-def render_body(payload: dict) -> str:
+def _render_body_legacy(payload: dict) -> str:
     """Builds the page body as HTML, with no JavaScript.
 
     Everything is computed here: a browser running no scripts, a preview pane or
@@ -2744,44 +2539,72 @@ def render_body(payload: dict) -> str:
     return "\n".join(out)
 
 
-SKELETON_HEAD = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light dark">
-"""
+def render_body(payload: dict) -> str:
+    """Render the common dashboard overview plus Claude-specific session evidence."""
+    if payload.get("focus"):
+        return render_session_page(payload)
 
-SKELETON_MID = """</head>
-<body>
-"""
+    esc = html_escape
+    view = claude_dashboard_model(payload)
+    state = _state(payload)
+    served = bool(payload.get("served"))
+    period_controls = ""
+    session_controls = ""
+    if served:
+        current = payload["window"].get("days")
+        links = ['<div class="controls"><span class="eyebrow">Window</span><div class="segment">']
+        for days in (7, 30, 90, 365):
+            label = "1 year" if days >= 365 else f"{days} d"
+            mark = ' aria-current="page"' if current == days else ""
+            links.append(f'<a href="{esc(_query(state, days=days))}"{mark}>{label}</a>')
+        links.append('</div><span class="live">recomputed on every load</span></div>')
+        period_controls = "".join(links)
 
-SKELETON_TAIL = """</body>
-</html>
-"""
+    listing = payload.get("listing") or {}
+    sessions_note = ""
+    if served:
+        sort_sessions = listing.get("sort_sessions", DEFAULT_SESSION_SORT)
+        reset = ""
+        if listing.get("filter_sessions") or sort_sessions != DEFAULT_SESSION_SORT:
+            reset = f'<a class="reset" href="{esc(_query(state, sort="", q="", max=""))}">Clear</a>'
+        session_controls = ('<div class="filters"><form class="filter" method="get">'
+                     + _hidden("source", state["source"]) + _hidden("days", state["days"])
+                     + _hidden("tsort", state["tsort"])
+                     + _hidden("tq", state["tq"]) + '<span class="eyebrow">Sessions</span>'
+                     + _select("sort", list(SESSION_SORTS.items()), sort_sessions, "Sort")
+                     + '<label class="grow"><span>Filter</span><input type="search" name="q" '
+                     + f'placeholder="project or id" value="{esc(state["q"])}"></label>'
+                     + '<label><span>How many</span><input type="number" name="max" min="1" max="60" '
+                     + f'value="{int(listing.get("limit", 5))}"></label><button type="submit">Apply</button>'
+                     + reset + '</form></div>')
+        sessions_note = f'<p class="note">{len(payload["sessions"])} detailed session(s).</p>'
+
+    links = {
+        session["short"]: ("/session" + _query(state, id=session["id"]) if served
+                           else f'#s-{session["short"]}')
+        for session in payload["sessions"]
+    }
+    details = ""
+    if not served:
+        details = "\n".join(
+            f'<section id="s-{esc(session["short"])}"><h2>{esc(session["project"])} '
+            f'<span class="id">{esc(session["short"])}</span> — ${_money(session["cost"])}</h2>'
+            + "\n".join(render_session_detail(session, payload, standalone=False)) + '</section>'
+            for session in payload["sessions"]
+        )
+    return render_dashboard_overview(
+        view, source_controls=source_tabs(payload.get("dashboard_source"),
+                                          payload["window"].get("days")),
+        period_controls=period_controls, session_controls=session_controls,
+        sessions_note=sessions_note, session_links=links,
+        after_projects="\n".join(render_yield(payload)) if payload.get("yield") else "",
+        details=details)
 
 
 def write_dashboard(payload: dict, out_path: Path):
-    """Assembles a full HTML document from the template.
-
-    The template is a fragment (title, styles, body) with no skeleton, and has to
-    stay that way to remain publishable as is. The standalone document, though,
-    needs the doctype and the charset, without which a browser opening the file
-    over file:// falls into quirks mode and mangles non-ASCII characters.
-    """
-    template = Path(__file__).with_name("cc-usage-template.html")
-    if not template.exists():
-        raise SystemExit(f"template not found: {template}")
-    fragment = template.read_text(encoding="utf-8").replace(
-        "<!--__BODY__-->", render_body(payload))
-    marker = "</style>"
-    cut = fragment.find(marker)
-    if cut == -1:
-        raise SystemExit("invalid template: no <style> block")
-    cut += len(marker)
-    head, body = fragment[:cut], fragment[cut:]
-    out_path.write_text(
-        SKELETON_HEAD + head + SKELETON_MID + body + SKELETON_TAIL,
+    """Write a standalone Claude dashboard from its fragment and shared base."""
+    out_path.write_text(render_dashboard_document(
+        Path(__file__), "Claude Code Token Usage", render_body(payload)),
         encoding="utf-8")
     return out_path
 
@@ -3158,7 +2981,7 @@ def serve(port: int, default_days: int | None, extra: list[str]):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--days", type=int, help="rolling window, in days")
+    parser.add_argument("--days", type=int, default=30, help="rolling window, in days (default: 30)")
     parser.add_argument("--since", help="ISO start date (YYYY-MM-DD)")
     parser.add_argument("--by", choices=("repo", "cwd", "dir"), default="repo",
                         help="grouping key (default: git root)")
@@ -3206,6 +3029,8 @@ def main():
                         help="serve the dashboard on the loopback interface and re-run "
                              "the analysis on every load (default: port 8787)")
     parser.add_argument("--served", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--dashboard-source", choices=("claude", "codex"),
+                        help=argparse.SUPPRESS)
     parser.add_argument("--no-cost-state", action="store_true",
                         help="ignore cost-state counters, recompute everything from transcripts")
     parser.add_argument("--no-fetch", action="store_true",
@@ -3276,6 +3101,7 @@ def main():
         payload = {
             "generated": datetime.now(timezone.utc).isoformat(),
             "served": args.served,
+            "dashboard_source": args.dashboard_source,
             "window": window_meta(since, args.days),
             "listing": {"sort_sessions": args.sort_sessions,
                         "filter_sessions": args.filter_sessions or "",
@@ -3485,6 +3311,7 @@ def main():
         payload = {
             "generated": datetime.now(timezone.utc).isoformat(),
             "served": args.served,
+            "dashboard_source": args.dashboard_source,
             "window": window_meta(since, args.days),
             "coverage": {"measured": len(seen_sessions), "total": len(total.sessions)},
             "yield": None if args.no_git else yield_report(
