@@ -3,3 +3,4 @@ __pycache__/
 *.html
 !usage-dashboard-template.html
 .DS_Store
+.claude/

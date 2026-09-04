@@ -19,6 +19,8 @@ import webbrowser
 
 
 SOURCES = {"claude": "cc-usage.py", "codex": "codex-usage.py"}
+# The gateway is served to this machine and to nothing else.
+LOOPBACK_HOST = "127.0.0.1"
 CLAUDE_SORTS = {"date-desc", "date-asc", "cost-desc", "cost-asc", "project-asc"}
 CLAUDE_TURN_SORTS = {"cost-desc", "cost-asc", "added-desc", "context-desc", "turn-asc", "turn-desc"}
 CODEX_SORTS = {"tokens-desc", "tokens-asc", "recent-desc", "recent-asc", "project-asc"}
@@ -30,8 +32,8 @@ def _value(params: dict[str, list[str]], name: str, limit: int = 160) -> str:
     return ((params.get(name) or [""])[0] or "").strip()[:limit]
 
 
-def _dashboard_command(source: str, output: Path, days: int, path: str,
-                       params: dict[str, list[str]]) -> list[str]:
+def dashboard_command(source: str, output: Path, days: int, path: str,
+                      params: dict[str, list[str]]) -> list[str]:
     """Build one validated collector command for a dashboard request."""
     script = Path(__file__).with_name(SOURCES[source])
     command = [sys.executable, str(script), "--dashboard", str(output), "--served",
@@ -70,8 +72,8 @@ def _dashboard_command(source: str, output: Path, days: int, path: str,
     return command
 
 
-def serve(port: int, default_days: int) -> None:
-    """Serve both local collectors through a single source-selecting page."""
+def gateway_server(port: int, default_days: int):
+    """One gateway server, bound to ``LOOPBACK_HOST`` and to no other address."""
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args: object) -> None:
             sys.stderr.write(f"  {self.address_string()} {fmt % args}\n")
@@ -95,7 +97,7 @@ def serve(port: int, default_days: int) -> None:
                 output = Path(handle.name)
             try:
                 run = subprocess.run(
-                    _dashboard_command(source, output, days, parsed.path, params),
+                    dashboard_command(source, output, days, parsed.path, params),
                     capture_output=True, text=True, timeout=180,
                 )
                 if run.returncode != 0 or not output.exists() or not output.stat().st_size:
@@ -111,8 +113,13 @@ def serve(port: int, default_days: int) -> None:
             self.end_headers()
             self.wfile.write(document)
 
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    url = f"http://127.0.0.1:{server.server_port}/"
+    return http.server.ThreadingHTTPServer((LOOPBACK_HOST, port), Handler)
+
+
+def serve(port: int, default_days: int) -> None:
+    """Serve both local collectors through a single source-selecting page."""
+    server = gateway_server(port, default_days)
+    url = f"http://{LOOPBACK_HOST}:{server.server_port}/"
     print(f"Dashboard served at {url}")
     print("Claude Code is selected by default. Ctrl+C to stop.")
     threading.Timer(.4, lambda: webbrowser.open(url)).start()

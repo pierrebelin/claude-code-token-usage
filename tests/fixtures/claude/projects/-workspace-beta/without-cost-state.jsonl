@@ -1,0 +1,2 @@
+{"type":"user","sessionId":"session-beta","cwd":"/workspace/beta","timestamp":"2026-08-31T08:00:00Z","message":{"role":"user","content":"what does this cost"}}
+{"type":"assistant","sessionId":"session-beta","cwd":"/workspace/beta","gitBranch":"work","timestamp":"2026-08-31T08:00:30Z","message":{"id":"msg-beta-1","model":"claude-sonnet-5","usage":{"input_tokens":80,"output_tokens":25,"cache_read_input_tokens":500,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"About a cent."}]}}

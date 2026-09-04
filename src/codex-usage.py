@@ -41,6 +41,8 @@ SESSION_ROOTS = (
     ("archived", Path.home() / ".codex" / "archived_sessions"),
 )
 ROLL_OUT_DATE_LENGTH = len("rollout-YYYY-MM-DD")
+# The dashboard is served to this machine and to nothing else.
+LOOPBACK_HOST = "127.0.0.1"
 GIT_LEAD_SECONDS = 120
 GIT_GRACE_SECONDS = 30 * 60
 GIT_MAX_PROJECTS = 8
@@ -159,12 +161,12 @@ def rollout_id(path: Path) -> str:
 
 
 def discover_rollouts(
-    roots: Iterable[tuple[str, Path]] = SESSION_ROOTS,
+    roots: Iterable[tuple[str, Path]] | None = None,
     since: date | None = None,
 ) -> list[RolloutFile]:
     """Find journal files and apply the date window before opening any JSONL."""
     found = []
-    for source, root in roots:
+    for source, root in SESSION_ROOTS if roots is None else roots:
         if not root.is_dir():
             continue
         for path in root.rglob("rollout-*.jsonl"):
@@ -1316,15 +1318,15 @@ def collect_payload(
     return payload_for(sessions, since, until, by=by, git=git)
 
 
-def serve_dashboard(
+def dashboard_server(
     port: int,
     default_since: date | None,
     default_days: int | None,
     project: str | None,
     by: str,
     no_git: bool,
-) -> None:
-    """Serve dashboard views only on loopback, recomputing local observations."""
+):
+    """One dashboard server, bound to ``LOOPBACK_HOST`` and to no other address."""
     import http.server
     import urllib.parse
 
@@ -1377,8 +1379,20 @@ def serve_dashboard(
             self.end_headers()
             self.wfile.write(encoded)
 
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"Dashboard served at http://127.0.0.1:{server.server_port}/")
+    return http.server.ThreadingHTTPServer((LOOPBACK_HOST, port), Handler)
+
+
+def serve_dashboard(
+    port: int,
+    default_since: date | None,
+    default_days: int | None,
+    project: str | None,
+    by: str,
+    no_git: bool,
+) -> None:
+    """Serve dashboard views only on loopback, recomputing local observations."""
+    server = dashboard_server(port, default_since, default_days, project, by, no_git)
+    print(f"Dashboard served at http://{LOOPBACK_HOST}:{server.server_port}/")
     print("Every load re-runs the local analysis. Ctrl+C to stop.")
     try:
         server.serve_forever()

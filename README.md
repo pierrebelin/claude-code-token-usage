@@ -15,11 +15,10 @@ The repository *is* a Claude Code skill. Clone it into `~/.claude/skills/`:
 git clone https://github.com/pierrebelin/claude-code-token-usage.git ~/.claude/skills/token-usage
 ```
 
-Copy **everything** — `SKILL.md`, `cc-usage.py`, `codex-usage.py`, `codex_log.py`,
-`codex_grade.py`, `session_grade.py`, `usage-dashboard.py`,
-`usage-dashboard-template.html`, `dashboard_template.py`, `dashboard_model.py`,
-`usage-dashboard-base.css`, `README.md`.
-The script looks for the shared front and its local transformation layer in its
+Copy **everything** — `SKILL.md`, `README.md`, and the whole `src/` directory: the
+modules, the dashboard template `usage-dashboard-template.html` and its stylesheet
+`usage-dashboard-base.css`.
+A script looks for the shared front and its local transformation layer in its
 own directory, and the folder name is what `/token-usage` resolves to.
 
 Then ask in plain language:
@@ -38,7 +37,7 @@ That reading grid is why the skill install beats a bare script.
 ## Dashboard
 
 ```bash
-python3 ~/.claude/skills/token-usage/usage-dashboard.py --serve
+python3 ~/.claude/skills/token-usage/src/usage-dashboard.py --serve
 ```
 
 `http://127.0.0.1:8787/`, loopback only, re-runs the selected analysis on every load.
@@ -84,7 +83,7 @@ cc-usage.py --dashboard session.html --focus 420f8978   # one session
 The script is standalone:
 
 ```bash
-echo "alias ccusage='python3 ~/.claude/skills/token-usage/cc-usage.py'" >> ~/.zshrc
+echo "alias ccusage='python3 ~/.claude/skills/token-usage/src/cc-usage.py'" >> ~/.zshrc
 ```
 
 ```bash
@@ -221,7 +220,7 @@ $0.42 · ctx 84k` — in about 0.1 s. Wire it into `~/.claude/settings.json`:
 
 ```json
 { "statusLine": { "type": "command",
-                  "command": "python3 ~/.claude/skills/token-usage/cc-usage.py --statusline" } }
+                  "command": "python3 ~/.claude/skills/token-usage/src/cc-usage.py --statusline" } }
 ```
 
 It appends `cache rebuilds $X` once that figure passes 50 cents, which is the one
@@ -334,7 +333,7 @@ rather than an anecdote. Run it on yours; the shape holds, the numbers will not.
   or a file that cannot be read is skipped rather than reported as a fault.
 - Two optional outbound requests, neither carrying your data: the LiteLLM price file
   (`--no-fetch`) and the Google Fonts the page loads. For zero external request, delete
-  the system-font declarations in `usage-dashboard-template.html`.
+  the system-font declarations in `src/usage-dashboard-template.html`.
 
 ## Licence
 

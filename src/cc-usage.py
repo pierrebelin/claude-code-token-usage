@@ -563,86 +563,88 @@ def read_session(path: Path, with_subagents: bool = True):
     commands: set = set()
     meta = {"cwd": "", "branch": "", "session": path.stem, "reported": None,
             "compact_mids": compact_mids, "agents": [], "commands": commands}
-    for line in path.open(encoding="utf-8", errors="replace"):
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        kind = entry.get("type")
-        if kind == "cost-state" and entry.get("totalCostUSD"):
-            meta["reported"] = entry
-            continue
-        if entry.get("isCompactSummary"):
-            compactions += 1
-            pending_compaction = True
-        if kind == "user":
-            content = (entry.get("message") or {}).get("content")
-            blocks = content if isinstance(content, list) else []
-            has_result = False
-            for block in blocks:
-                if isinstance(block, dict) and block.get("type") == "tool_result":
-                    has_result = True
-                    body = block.get("content")
-                    size = len(body) if isinstance(body, str) else len(json.dumps(body or ""))
-                    raw = entry.get("toolUseResult")
-                    if isinstance(raw, str):
-                        size = max(size, len(raw))
-                    elif isinstance(raw, dict):
-                        size = max(size, len(json.dumps(raw)))
-                        if raw.get("agentId"):
-                            launched[raw["agentId"]] = {
-                                "tool_use_id": block.get("tool_use_id") or "",
-                                "description": raw.get("description") or "",
-                                "model": raw.get("resolvedModel") or "",
-                            }
-                    results[block.get("tool_use_id") or ""] = size
-            commands |= slash_commands(content)
-            if not has_result and not entry.get("isMeta"):
-                prompts += 1
-            continue
-        if kind != "assistant":
-            continue
-        message = entry.get("message") or {}
-        mid = message.get("id")
-        if not mid:
-            continue
-        if mid not in turns:
-            turns[mid] = Turn(
-                mid,
-                entry.get("timestamp") or "",
-                message.get("model") or "unknown",
-                bool(entry.get("isSidechain")),
-                entry.get("agentName") or "",
-                entry.get("attributionSkill") or "",
-            )
-            order.append(mid)
-            if pending_compaction:
-                compact_mids.add(mid)
-                pending_compaction = False
-            if entry.get("cwd"):
-                cwds[entry["cwd"]] += 1
-            if entry.get("gitBranch"):
-                branches[entry["gitBranch"]] += 1
-        turn = turns[mid]
-        if turn.usage is None and isinstance(message.get("usage"), dict):
-            usage = message["usage"]
-            turn.usage = usage
-            turn.output = int(usage.get("output_tokens") or 0)
-            turn.ctx = (
-                int(usage.get("input_tokens") or 0)
-                + int(usage.get("cache_read_input_tokens") or 0)
-                + int(usage.get("cache_creation_input_tokens") or 0)
-            )
-        for block in message.get("content") or []:
-            if not isinstance(block, dict):
+    handle = path.open(encoding="utf-8", errors="replace")
+    with handle:
+        for line in handle:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
                 continue
-            if block.get("type") == "tool_use":
-                turn.tools[block.get("id") or ""] = (
-                    block.get("name") or "?", block.get("input"))
-            elif block.get("type") == "text":
-                turn.text_len = max(turn.text_len, len(block.get("text") or ""))
-            elif block.get("type") == "thinking":
-                turn.think_len = max(turn.think_len, len(block.get("thinking") or ""))
+            kind = entry.get("type")
+            if kind == "cost-state" and entry.get("totalCostUSD"):
+                meta["reported"] = entry
+                continue
+            if entry.get("isCompactSummary"):
+                compactions += 1
+                pending_compaction = True
+            if kind == "user":
+                content = (entry.get("message") or {}).get("content")
+                blocks = content if isinstance(content, list) else []
+                has_result = False
+                for block in blocks:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        has_result = True
+                        body = block.get("content")
+                        size = len(body) if isinstance(body, str) else len(json.dumps(body or ""))
+                        raw = entry.get("toolUseResult")
+                        if isinstance(raw, str):
+                            size = max(size, len(raw))
+                        elif isinstance(raw, dict):
+                            size = max(size, len(json.dumps(raw)))
+                            if raw.get("agentId"):
+                                launched[raw["agentId"]] = {
+                                    "tool_use_id": block.get("tool_use_id") or "",
+                                    "description": raw.get("description") or "",
+                                    "model": raw.get("resolvedModel") or "",
+                                }
+                        results[block.get("tool_use_id") or ""] = size
+                commands |= slash_commands(content)
+                if not has_result and not entry.get("isMeta"):
+                    prompts += 1
+                continue
+            if kind != "assistant":
+                continue
+            message = entry.get("message") or {}
+            mid = message.get("id")
+            if not mid:
+                continue
+            if mid not in turns:
+                turns[mid] = Turn(
+                    mid,
+                    entry.get("timestamp") or "",
+                    message.get("model") or "unknown",
+                    bool(entry.get("isSidechain")),
+                    entry.get("agentName") or "",
+                    entry.get("attributionSkill") or "",
+                )
+                order.append(mid)
+                if pending_compaction:
+                    compact_mids.add(mid)
+                    pending_compaction = False
+                if entry.get("cwd"):
+                    cwds[entry["cwd"]] += 1
+                if entry.get("gitBranch"):
+                    branches[entry["gitBranch"]] += 1
+            turn = turns[mid]
+            if turn.usage is None and isinstance(message.get("usage"), dict):
+                usage = message["usage"]
+                turn.usage = usage
+                turn.output = int(usage.get("output_tokens") or 0)
+                turn.ctx = (
+                    int(usage.get("input_tokens") or 0)
+                    + int(usage.get("cache_read_input_tokens") or 0)
+                    + int(usage.get("cache_creation_input_tokens") or 0)
+                )
+            for block in message.get("content") or []:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    turn.tools[block.get("id") or ""] = (
+                        block.get("name") or "?", block.get("input"))
+                elif block.get("type") == "text":
+                    turn.text_len = max(turn.text_len, len(block.get("text") or ""))
+                elif block.get("type") == "thinking":
+                    turn.think_len = max(turn.think_len, len(block.get("thinking") or ""))
     if cwds:
         meta["cwd"] = cwds.most_common(1)[0][0]
     if branches:
@@ -682,30 +684,32 @@ def read_agent_turns(path: Path, label: str) -> list[Turn]:
     """The billed turns of one subagent transcript, deduplicated like the main one."""
     turns: dict[str, Turn] = {}
     order: list[str] = []
-    for line in path.open(encoding="utf-8", errors="replace"):
-        if '"usage"' not in line or '"assistant"' not in line:
-            continue
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if entry.get("type") != "assistant":
-            continue
-        message = entry.get("message") or {}
-        mid = message.get("id")
-        usage = message.get("usage")
-        if not mid or not isinstance(usage, dict) or mid in turns:
-            continue
-        turn = Turn(mid, entry.get("timestamp") or "",
-                    message.get("model") or "unknown", True, label,
-                    entry.get("attributionSkill") or "")
-        turn.usage = usage
-        turn.output = int(usage.get("output_tokens") or 0)
-        turn.ctx = (int(usage.get("input_tokens") or 0)
-                    + int(usage.get("cache_read_input_tokens") or 0)
-                    + int(usage.get("cache_creation_input_tokens") or 0))
-        turns[mid] = turn
-        order.append(mid)
+    handle = path.open(encoding="utf-8", errors="replace")
+    with handle:
+        for line in handle:
+            if '"usage"' not in line or '"assistant"' not in line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if entry.get("type") != "assistant":
+                continue
+            message = entry.get("message") or {}
+            mid = message.get("id")
+            usage = message.get("usage")
+            if not mid or not isinstance(usage, dict) or mid in turns:
+                continue
+            turn = Turn(mid, entry.get("timestamp") or "",
+                        message.get("model") or "unknown", True, label,
+                        entry.get("attributionSkill") or "")
+            turn.usage = usage
+            turn.output = int(usage.get("output_tokens") or 0)
+            turn.ctx = (int(usage.get("input_tokens") or 0)
+                        + int(usage.get("cache_read_input_tokens") or 0)
+                        + int(usage.get("cache_creation_input_tokens") or 0))
+            turns[mid] = turn
+            order.append(mid)
     return [turns[m] for m in order]
 
 

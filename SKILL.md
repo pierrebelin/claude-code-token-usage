@@ -8,8 +8,8 @@ description: "Analyses Claude Code token usage and cost, per project and inside 
 Local tool that rebuilds usage from `~/.claude/projects/**/*.jsonl`.
 Nothing leaves the machine. No dependency beyond the Python 3.10+ stdlib.
 
-The script sits next to this file: `cc-usage.py`. So does the dashboard template:
-`usage-dashboard-template.html`. The script looks for the template in its own directory — moving
+The scripts live in `src/`, next to this file. So does the dashboard template:
+`src/usage-dashboard-template.html`. A script looks for the template in its own directory — moving
 one without the other breaks `--dashboard`.
 
 ## When to use it
@@ -28,28 +28,28 @@ one without the other breaks `--dashboard`.
 SKILL=~/.claude/skills/token-usage
 
 # per-project view
-python3 $SKILL/cc-usage.py --days 30 --top 12
+python3 $SKILL/src/cc-usage.py --days 30 --top 12
 
 # one session in detail (an id prefix is enough)
-python3 $SKILL/cc-usage.py --session 46e2620d --top 15
+python3 $SKILL/src/cc-usage.py --session 46e2620d --top 15
 
 # per-tool cost summed over every session in the window
-python3 $SKILL/cc-usage.py --days 30 --tools
+python3 $SKILL/src/cc-usage.py --days 30 --tools
 
 # three costly patterns worth opening next
-python3 $SKILL/cc-usage.py --days 7 --triage
+python3 $SKILL/src/cc-usage.py --days 7 --triage
 
 # what those sessions left in git: landed, reverted, never merged, no commit
-python3 $SKILL/cc-usage.py --days 30 --yield
+python3 $SKILL/src/cc-usage.py --days 30 --yield
 
 # every session in the window graded A to F on what it could have avoided
-python3 $SKILL/cc-usage.py --days 30 --audit
+python3 $SKILL/src/cc-usage.py --days 30 --audit
 
 # combined live dashboard, recomputed on every load (Claude Code selected by default)
-python3 $SKILL/usage-dashboard.py --serve
+python3 $SKILL/src/usage-dashboard.py --serve
 
 # frozen page, to archive or send
-python3 $SKILL/cc-usage.py --days 30 --dashboard ~/.claude/usage/report.html
+python3 $SKILL/src/cc-usage.py --days 30 --dashboard ~/.claude/usage/report.html
 ```
 
 Options: `--days` / `--since`, `--project <substring>`, `--by repo|cwd|dir`,

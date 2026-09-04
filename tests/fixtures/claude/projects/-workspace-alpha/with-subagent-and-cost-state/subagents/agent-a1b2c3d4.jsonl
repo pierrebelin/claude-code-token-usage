@@ -1,0 +1,1 @@
+{"type":"assistant","sessionId":"session-alpha","isSidechain":true,"timestamp":"2026-08-30T10:01:30Z","message":{"id":"msg-agent-1","model":"claude-haiku-4-5-20251001","usage":{"input_tokens":30,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"Mapped four directories."}]}}
